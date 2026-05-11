@@ -684,10 +684,14 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             //   n_ctx * 4  KV gather nodes (2 view + 2 cpy per token, K+V)
             //   2          K_full / V_full output tensors
             // Plus 64 global tensors (inputs, lm_head, output norm, mask).
+            // Per-layer: ~64 fixed intermediates + 4 tensor objects per KV slot
+            // written (n_new) + 4 per KV slot gathered (n_ctx), K and V.
+            // Multiply by 2: alignment padding inside ggml pool can waste up to
+            // one ggml_tensor_overhead() per alloc in the worst case.
             const size_t tensors_per_layer = 64
                                            + (size_t)n_new * 4
                                            + (size_t)n_ctx * 4;
-            const size_t max_nodes = (size_t)hp_.n_layer * tensors_per_layer + 128;
+            const size_t max_nodes = ((size_t)hp_.n_layer * tensors_per_layer + 256) * 2;
             const size_t ctx_size  = ggml_tensor_overhead() * max_nodes
                                    + ggml_graph_overhead_custom(max_nodes, false);
             ggml_init_params ip{ ctx_size, nullptr, true };
