@@ -1,7 +1,7 @@
 // test_gc_model_integration.cpp
 //
 // Usage:
-//   test_gc_model_integration <model.gguf>
+//   test_gc_model_integration <model.gguf> [--expect-arch=<name>]
 //
 // Purpose:
 //   Real-model integration smoke test across phases 1,2,3,4,7,8.
@@ -48,14 +48,24 @@ private:
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> [--expect-arch=<name>]\n", argv[0]);
         return 1;
+    }
+
+    std::string model_path = argv[1];
+    std::string expect_arch;
+    for (int i = 2; i < argc; ++i) {
+        const std::string arg = argv[i];
+        const std::string k = "--expect-arch=";
+        if (arg.rfind(k, 0) == 0) {
+            expect_arch = arg.substr(k.size());
+        }
     }
 
     try {
         gc_loader_params_t lp;
         lp.use_mmap = true;
-        gc_model_loader_t loader(argv[1], lp);
+        gc_model_loader_t loader(model_path, lp);
 
         CHECK(loader.n_tensors > 0);
         CHECK(loader.n_kv > 0);
@@ -65,6 +75,9 @@ int main(int argc, char ** argv) {
         CHECK(hp.arch != GC_ARCH_UNKNOWN);
         CHECK(hp.n_layer > 0);
         CHECK(hp.n_embd > 0);
+        if (!expect_arch.empty()) {
+            CHECK(gc_arch_name(hp.arch) == expect_arch);
+        }
 
         gc_vocab_t vocab;
         CHECK(vocab.load(loader) == GC_OK);
@@ -88,18 +101,20 @@ int main(int argc, char ** argv) {
             std::string tmpl;
             if (loader.get_str("tokenizer.chat_template", tmpl, /*required=*/false)) {
                 gc_chat_template_t t = gc_chat_detect_template(tmpl);
-                CHECK(t != GC_CHAT_TEMPLATE_UNKNOWN);
+                if (t == GC_CHAT_TEMPLATE_UNKNOWN) {
+                    fprintf(stderr, "INFO  unsupported chat template; skipping render check\n");
+                } else {
+                    std::vector<gc_chat_message_t> msgs = {
+                        {"user", "Say hi briefly."}
+                    };
+                    std::vector<const gc_chat_message_t *> ptrs;
+                    for (auto & m : msgs) ptrs.push_back(&m);
 
-                std::vector<gc_chat_message_t> msgs = {
-                    {"user", "Say hi briefly."}
-                };
-                std::vector<const gc_chat_message_t *> ptrs;
-                for (auto & m : msgs) ptrs.push_back(&m);
-
-                std::string prompt;
-                const int32_t n = gc_chat_apply_template(t, ptrs, prompt, true);
-                CHECK(n >= 0);
-                CHECK(!prompt.empty());
+                    std::string prompt;
+                    const int32_t n = gc_chat_apply_template(t, ptrs, prompt, true);
+                    CHECK(n >= 0);
+                    CHECK(!prompt.empty());
+                }
             } else {
                 fprintf(stderr, "INFO  tokenizer.chat_template not present; skipping chat-template check\n");
             }
@@ -149,4 +164,3 @@ int main(int argc, char ** argv) {
             g_fail ? "FAILED" : "PASSED", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
-

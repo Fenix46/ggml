@@ -261,6 +261,37 @@ bool gc_model_loader_t::get_u32(const std::string & key, uint32_t & out, bool re
     if (t == GGUF_TYPE_UINT32) { out = gguf_get_val_u32(gguf_ctx.get(), k); return true; }
     if (t == GGUF_TYPE_UINT16) { out = gguf_get_val_u16(gguf_ctx.get(), k); return true; }
     if (t == GGUF_TYPE_UINT8)  { out = gguf_get_val_u8 (gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_INT32)  {
+        const int32_t v = gguf_get_val_i32(gguf_ctx.get(), k);
+        if (v < 0) throw std::runtime_error(gc__format("GGUF key '%s' negative int32 cannot convert to uint32", key.c_str()));
+        out = (uint32_t)v;
+        return true;
+    }
+    if (t == GGUF_TYPE_INT16)  {
+        const int16_t v = gguf_get_val_i16(gguf_ctx.get(), k);
+        if (v < 0) throw std::runtime_error(gc__format("GGUF key '%s' negative int16 cannot convert to uint32", key.c_str()));
+        out = (uint32_t)v;
+        return true;
+    }
+    if (t == GGUF_TYPE_INT8)   {
+        const int8_t v = gguf_get_val_i8(gguf_ctx.get(), k);
+        if (v < 0) throw std::runtime_error(gc__format("GGUF key '%s' negative int8 cannot convert to uint32", key.c_str()));
+        out = (uint32_t)v;
+        return true;
+    }
+    if (t == GGUF_TYPE_UINT64) {
+        const uint64_t v = gguf_get_val_u64(gguf_ctx.get(), k);
+        if (v > UINT32_MAX) throw std::runtime_error(gc__format("GGUF key '%s' uint64 overflows uint32", key.c_str()));
+        out = (uint32_t)v;
+        return true;
+    }
+    if (t == GGUF_TYPE_INT64)  {
+        const int64_t v = gguf_get_val_i64(gguf_ctx.get(), k);
+        if (v < 0 || v > (int64_t)UINT32_MAX) throw std::runtime_error(gc__format("GGUF key '%s' int64 out of uint32 range", key.c_str()));
+        out = (uint32_t)v;
+        return true;
+    }
+    if (!required) return false;
     throw std::runtime_error(gc__format("GGUF key '%s' expected uint type", key.c_str()));
 }
 
@@ -287,11 +318,26 @@ bool gc_model_loader_t::get_i32(const std::string & key, int32_t & out, bool req
 bool gc_model_loader_t::get_f32(const std::string & key, float & out, bool required) const {
     int k = find_key(key);
     if (k < 0) { gc__require(key, false, required); return false; }
-    if (gguf_get_kv_type(gguf_ctx.get(), k) != GGUF_TYPE_FLOAT32) {
-        throw std::runtime_error(gc__format("GGUF key '%s' expected float32", key.c_str()));
+    const gguf_type t = gguf_get_kv_type(gguf_ctx.get(), k);
+    if (t == GGUF_TYPE_FLOAT32) {
+        out = gguf_get_val_f32(gguf_ctx.get(), k);
+        return true;
     }
-    out = gguf_get_val_f32(gguf_ctx.get(), k);
-    return true;
+    if (t == GGUF_TYPE_FLOAT64) {
+        out = (float)gguf_get_val_f64(gguf_ctx.get(), k);
+        return true;
+    }
+    if (t == GGUF_TYPE_UINT32) { out = (float)gguf_get_val_u32(gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_INT32)  { out = (float)gguf_get_val_i32(gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_UINT64) { out = (float)gguf_get_val_u64(gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_INT64)  { out = (float)gguf_get_val_i64(gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_UINT16) { out = (float)gguf_get_val_u16(gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_INT16)  { out = (float)gguf_get_val_i16(gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_UINT8)  { out = (float)gguf_get_val_u8(gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_INT8)   { out = (float)gguf_get_val_i8(gguf_ctx.get(), k); return true; }
+    if (t == GGUF_TYPE_BOOL)   { out = gguf_get_val_bool(gguf_ctx.get(), k) ? 1.0f : 0.0f; return true; }
+    if (!required) return false;
+    throw std::runtime_error(gc__format("GGUF key '%s' expected float32", key.c_str()));
 }
 
 bool gc_model_loader_t::get_bool(const std::string & key, bool & out, bool required) const {
