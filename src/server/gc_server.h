@@ -1,5 +1,7 @@
 #pragma once
 
+#include "gc_chat.h"
+
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -23,6 +25,9 @@ struct gc_server_token_event_t {
     std::string req_id;
     int32_t     token = -1;
     bool        finished = false;
+    // Only meaningful when finished==true.
+    // Values: "stop" (EOS), "length" (max_tokens), "abort" (cancelled/error).
+    std::string finish_reason;
 };
 
 class gc_server_runtime_t {
@@ -59,6 +64,7 @@ struct gc_server_params_t {
     int         port = 8080;
     gc_server_runtime_t * runtime = nullptr; // non-owning; optional
     gc_server_detokenize_fn_t detokenize_fn;
+    gc_chat_template_t chat_template = GC_CHAT_TEMPLATE_UNKNOWN;
 };
 
 class gc_server_t {

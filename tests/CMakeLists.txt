@@ -489,3 +489,27 @@ target_include_directories(test_gc_generation_runtime PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 set_target_properties(test_gc_generation_runtime PROPERTIES CXX_STANDARD 17)
+
+# Run manually: test_gc_llama_forward <model.gguf> [--prompt TEXT] [--chat]
+# Validation lane for the real CPU-only Llama forward path. Not added to CTest
+# because it requires a local GGUF model and can be slow.
+add_executable(test_gc_llama_forward test_gc_llama_forward.cpp)
+target_link_libraries(test_gc_llama_forward PRIVATE
+    gc_loader
+    gc_arch
+    gc_vocab
+    gc_chat
+    gc_engine
+    ggml
+)
+target_include_directories(test_gc_llama_forward PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/loader
+    ${CMAKE_SOURCE_DIR}/src/arch
+    ${CMAKE_SOURCE_DIR}/src/vocab
+    ${CMAKE_SOURCE_DIR}/src/chat
+    ${CMAKE_SOURCE_DIR}/src/engine
+    ${CMAKE_SOURCE_DIR}/src/scheduler
+    ${CMAKE_SOURCE_DIR}/src/kvcache
+    ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(test_gc_llama_forward PROPERTIES CXX_STANDARD 17)

@@ -30,6 +30,10 @@ struct gc_batch_entry_t {
     // The runner MUST sample a token when is_last_prefill=true (it produces
     // the first output token, which seeds the decode loop).
     bool                 is_last_prefill    = false;
+
+    // Per-request sampling params, copied from gc_request_t::sampling_params.
+    // The model runner MUST use these instead of any global config defaults.
+    gc_sampling_params_t sampling_params;
 };
 
 struct gc_batch_t {
@@ -78,6 +82,11 @@ public:
 
     // Number of KV layers (used to validate block_ids size).
     virtual int num_layers() const = 0;
+
+    // Release any per-request state (sampling history, rep-penalty window).
+    // Called by the engine when a request is aborted or finishes.
+    // Default: no-op.  Concrete runners override if they cache per-req state.
+    virtual void release_request(const std::string & /*req_id*/) {}
 };
 
 class gc_ggml_model_runner_t;
@@ -125,6 +134,7 @@ public:
     explicit gc_ggml_model_runner_t(config_t cfg);
     gc_model_output_t execute(const gc_batch_t & batch) override;
     int num_layers() const override;
+    void release_request(const std::string & req_id) override;
 
 private:
     struct req_state_t {
@@ -137,7 +147,11 @@ private:
     std::unordered_map<std::string, req_state_t> req_state_;
 
     std::vector<float> build_logits(const gc_batch_entry_t & e, req_state_t & st) const;
+    // sample_token: uses global cfg_ params (legacy path, prefer sample_token_with_params).
     int32_t sample_token(std::vector<float> logits);
+    // sample_token_with_params: explicit per-request params.
+    int32_t sample_token_with_params(std::vector<float> logits,
+                                     float temperature, int top_k, float top_p);
     void apply_repetition_penalty(std::vector<float> & logits, const req_state_t & st) const;
 };
 

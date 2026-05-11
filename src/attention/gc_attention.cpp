@@ -131,7 +131,11 @@ struct ggml_tensor * gc_build_attn_mha(
         // flash_attn_ext output: [n_embd_head_v, n_tokens, n_head, 1]
         cur = ggml_reshape_2d(ctx, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
     } else {
-        // Standard attention path
+        // Standard attention path.
+        // For GQA/MQA, keep K/V at n_head_kv. ggml_mul_mat handles the grouped
+        // broadcast across Q heads. Manually repeating K/V is wrong because it
+        // produces [0..kv, 0..kv, ...] instead of grouped [0,0,0,0,1,1,...].
+
         // kq = Q * K^T → [n_kv_tokens, n_q_tokens, n_head, 1]
         struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
         cb(kq, "attn_kq", il);

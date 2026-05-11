@@ -118,7 +118,8 @@ public:
         float    top_p             = 0.95f;
         float    repetition_penalty = 1.1f;
         int      repetition_window  = 64;
-        int      n_threads          = 4;    // CPU thread count for fallback
+        int      n_threads          = 4;    // CPU thread count
+        bool     force_cpu          = false; // skip GPU/Metal, use CPU only
     };
 
     gc_graph_runner_t(const gc_model_loader_t * loader,
@@ -132,6 +133,11 @@ public:
 
     gc_model_output_t execute(const gc_batch_t & batch) override;
     int num_layers() const override { return (int)hp_.n_layer; }
+    void release_request(const std::string & req_id) override;
+
+    // Debug/validation only: raw logits read from the last executed entry,
+    // before repetition penalty and sampling. Used by manual golden tests.
+    const std::vector<float> & debug_last_logits() const { return last_logits_; }
 
 private:
     const gc_model_loader_t * loader_ = nullptr;
@@ -176,6 +182,7 @@ private:
     };
     std::mt19937_64                               rng_;
     std::unordered_map<std::string, req_state_t>  req_state_;
+    std::vector<float>                            last_logits_;
 
     // ── Instrumentation ───────────────────────────────────────────────────────
     // Counters exposed for debugging / assertions.
@@ -213,6 +220,8 @@ private:
 
     // ── Sampling ──────────────────────────────────────────────────────────────
     void    apply_rep_penalty(std::vector<float> & logits,
-                               const req_state_t & st) const;
-    int32_t sample(std::vector<float> logits);
+                               const req_state_t & st,
+                               float rep_penalty, int rep_window) const;
+    int32_t sample(std::vector<float> logits,
+                   float temperature, int top_k, float top_p);
 };

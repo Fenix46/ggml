@@ -19,6 +19,9 @@ void gc_engine_t::add_request(std::unique_ptr<gc_request_t> req) {
 
 void gc_engine_t::abort_request(const std::string & req_id) {
     sched_.abort_request(req_id);
+    // Immediately drop per-request state from the runner so memory is not
+    // held until the next execute() call notices the request is absent.
+    if (runner_) runner_->release_request(req_id);
 }
 
 // ── build_batch() ─────────────────────────────────────────────────────────────
@@ -56,6 +59,7 @@ gc_batch_t gc_engine_t::build_batch(const gc_sched_output_t & sched_out) const {
             e.position_ids[i] = nr.num_computed_tokens + i;
         }
 
+        e.sampling_params = nr.sampling_params;
         batch.total_tokens += n;
         batch.entries.push_back(std::move(e));
     }
@@ -94,6 +98,7 @@ gc_batch_t gc_engine_t::build_batch(const gc_sched_output_t & sched_out) const {
             e.position_ids[i] = cr.num_computed_tokens + i;
         }
 
+        e.sampling_params = cr.sampling_params;
         batch.total_tokens += n;
         batch.entries.push_back(std::move(e));
     }
@@ -132,21 +137,25 @@ gc_step_output_t gc_engine_t::process_output(
         ro.token  = tok;
 
         // A request is finished if update_from_output() moved it out of the
-        // running set (kv_mgr_ entry freed) OR it appears in finished_req_ids.
+        // running set (kv_mgr_ entry freed) OR it appears in finished_reqs.
         // kv_mgr_proxy returns nullptr both for unknown requests AND for
         // finished ones — both mean "not running", which is what we want here.
-        const bool in_finished_set = (sched_out.finished_req_ids.count(req_id) > 0);
+        const auto fin_it = sched_out.finished_reqs.find(req_id);
+        const bool in_finished_set  = (fin_it != sched_out.finished_reqs.end());
         const bool no_longer_running = (sched_.kv_mgr_proxy(req_id) == nullptr);
         ro.finished = in_finished_set || no_longer_running;
         if (ro.finished) {
-            ro.finish_reason = GC_REQ_FINISHED_STOPPED;
+            // Use the exact finish reason from the scheduler when available.
+            // Fall back to STOPPED (EOS) when kv_mgr says "not running" but
+            // we have no explicit entry — this happens for mid-step aborts.
+            ro.finish_reason = in_finished_set ? fin_it->second : GC_REQ_FINISHED_STOPPED;
         }
         out.outputs.push_back(ro);
     }
 
     // Also report requests that finished this step without generating a token
     // (aborted, or finished by the scheduler for other reasons).
-    for (const auto & fid : sched_out.finished_req_ids) {
+    for (const auto & [fid, freason] : sched_out.finished_reqs) {
         bool already = false;
         for (auto & o : out.outputs) { if (o.req_id == fid) { already = true; break; } }
         if (!already) {
@@ -154,9 +163,11 @@ gc_step_output_t gc_engine_t::process_output(
             ro.req_id        = fid;
             ro.token         = -1;
             ro.finished      = true;
-            ro.finish_reason = GC_REQ_FINISHED_STOPPED;
+            ro.finish_reason = freason;
             out.outputs.push_back(ro);
         }
+        // Release runner-side per-request state immediately on finish.
+        if (runner_) runner_->release_request(fid);
     }
 
     return out;
@@ -171,6 +182,18 @@ gc_step_output_t gc_engine_t::step() {
     if (sched_out.empty()) return {};
 
     gc_batch_t batch = build_batch(sched_out);
+
+    // Sanity check: every batch entry must have at least one token.
+    for (const auto & e : batch.entries) {
+        assert(!e.token_ids.empty() &&
+               "engine::step: batch entry has no token_ids");
+        assert(e.token_ids.size() == e.position_ids.size() &&
+               "engine::step: token_ids and position_ids size mismatch");
+        assert(e.num_computed >= 0 &&
+               "engine::step: negative num_computed");
+        assert(e.num_new_tokens == (int)e.token_ids.size() &&
+               "engine::step: num_new_tokens inconsistent with token_ids");
+    }
 
     gc_model_output_t model_out;
     if (!batch.empty()) {

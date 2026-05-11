@@ -22,16 +22,45 @@ static inline bool gc_req_is_finished(gc_req_status_t s) {
     return s >= GC_REQ_FINISHED_STOPPED;
 }
 
-// ── Sampling params (minimal — extended in Phase 8) ───────────────────────────
+// Validate a state transition.  Returns true if the transition is legal.
+// Legal transitions mirror vllm v1 SequenceStatus:
+//   WAITING  → RUNNING   (first schedule / resume after preemption)
+//   RUNNING  → PREEMPTED (KV eviction)
+//   RUNNING  → FINISHED  (EOS / length / abort)
+//   PREEMPTED→ WAITING   (re-queued for recompute)
+// All other transitions are bugs.
+static inline bool gc_req_transition_valid(gc_req_status_t from, gc_req_status_t to) {
+    if (from == GC_REQ_WAITING   && to == GC_REQ_RUNNING)           return true;
+    if (from == GC_REQ_RUNNING   && to == GC_REQ_PREEMPTED)         return true;
+    if (from == GC_REQ_RUNNING   && gc_req_is_finished(to))         return true;
+    if (from == GC_REQ_PREEMPTED && to == GC_REQ_WAITING)           return true;
+    // Re-admit after preemption (re-scheduled directly to RUNNING)
+    if (from == GC_REQ_PREEMPTED && to == GC_REQ_RUNNING)           return true;
+    return false;
+}
+
+// ── Sampling params ────────────────────────────────────────────────────────────
 
 struct gc_sampling_params_t {
+    // Generation budget
     int     max_tokens    = 512;
+
+    // Sampling controls (applied per-request by the model runner)
     float   temperature   = 1.0f;
     float   top_p         = 1.0f;
-    int     top_k         = -1;
-    // EOS token id for this request. Set to < 0 to disable EOS-by-id stop.
-    int32_t eos_token_id  = 2;
+    int     top_k         = -1;      // -1 = disabled (sample from full vocab)
+    float   min_p         = 0.0f;    // 0 = disabled
+    float   repetition_penalty = 1.0f; // 1.0 = disabled
+    int     repetition_window  = 64;
+    uint64_t seed         = 0;       // 0 = use engine global seed
+
+    // Stop conditions
+    int32_t eos_token_id  = 2;       // < 0 → disable EOS-by-id
     bool    ignore_eos    = false;
+
+    // Multi-token stop strings: each inner vector is a tokenized stop sequence.
+    // Checked after every output token. First match wins.
+    std::vector<std::vector<int32_t>> stop_token_ids;
 };
 
 // ── Request ───────────────────────────────────────────────────────────────────

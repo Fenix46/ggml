@@ -2381,8 +2381,6 @@ void gc_vocab_t::impl::load(const gc_model_loader_t & ml) {
                         || t.first == "<|im_end|>"
                         || t.first == "<|end|>"
                         || t.first == "<end_of_turn>"
-                        || t.first == "<|endoftext|>"
-                        || t.first == "<|end_of_text|>" // granite
                         || t.first == "<EOT>"
                         || t.first == "_<EOT>"
                         || t.first == "[EOT]" // Kimi-K2

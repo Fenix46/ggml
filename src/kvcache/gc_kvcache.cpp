@@ -1,8 +1,8 @@
 #include "gc_kvcache.h"
+#include "gc_debug.h"
 
 #include <cassert>
 #include <cstring>
-#include <stdexcept>
 
 // ── Block hash ────────────────────────────────────────────────────────────────
 // FNV-1a 64-bit: deterministic, no external deps, fast.
@@ -343,11 +343,24 @@ const gc_req_blocks_t * gc_kv_manager_t::allocate_slots(
         return nullptr;
     }
 
+    GC_LOG_KV("allocate req=%s tokens=%d is_running=%d cached=%d new=%d",
+              request_id.c_str(), num_tokens, (int)is_running,
+              (int)cached_blocks.size(), new_blocks_need);
+
     gc_req_blocks_t & rb = req_blocks_[request_id];
     // Block table must be empty for a new request.
     assert(rb.blocks.empty() && "block table must be empty for new request");
     rb.blocks.insert(rb.blocks.end(), cached_blocks.begin(), cached_blocks.end());
     rb.blocks.insert(rb.blocks.end(), new_blks.begin(),     new_blks.end());
+
+    // Safety: no real token should be assigned to the null block (block_id=0).
+    // The null block is a zero-filled sentinel; writing to it corrupts all
+    // requests that share a prefix matching the empty block.
+    for (const auto * b : rb.blocks) {
+        assert(b != nullptr && "allocate_slots: null block pointer in table");
+        assert((b->is_null || b->block_id > 0) &&
+               "allocate_slots: real token slot maps to null block (block_id=0)");
+    }
 
     // Validate: no duplicate writable block ownership.
     // Each block must appear at most once in this table.
@@ -391,6 +404,12 @@ void gc_kv_manager_t::free(const std::string & request_id) {
 
     // Free in reverse order so tail blocks are evicted first (LRU-friendly).
     auto & blks = it->second.blocks;
+    GC_LOG_KV("free req=%s blocks=%d", request_id.c_str(), (int)blks.size());
+    for (const auto * b : blks) {
+        assert(b != nullptr && "kv_manager::free: null block pointer");
+        assert(b->ref_cnt > 0 &&
+               "kv_manager::free: block ref_cnt already 0 (double-free)");
+    }
     std::vector<gc_kv_block_t *> rev(blks.rbegin(), blks.rend());
     pool_.free_blocks(rev);
     req_blocks_.erase(it);

@@ -1,9 +1,9 @@
 #include "gc_scheduler.h"
+#include "gc_debug.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
-#include <stdexcept>
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -55,9 +55,9 @@ void gc_scheduler_t::add_request(std::unique_ptr<gc_request_t> req) {
     } else {
         waiting_fcfs_.push_back(raw);
     }
+    GC_LOG_REQ("admit req=%s waiting=%d", raw->request_id.c_str(), num_waiting());
     if (params_.enable_sched_trace) {
-        std::fprintf(stderr, "[sched] admit req=%s waiting=%d\n",
-                     raw->request_id.c_str(), num_waiting());
+        GC_LOG_SCHED("admit req=%s waiting=%d", raw->request_id.c_str(), num_waiting());
     }
 }
 
@@ -86,30 +86,37 @@ void gc_scheduler_t::abort_request(const std::string & req_id) {
         }
     }
 
-    finished_req_ids_.insert(req_id);
+    finished_reqs_[req_id] = GC_REQ_FINISHED_ABORTED;
     all_reqs_.erase(it);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 void gc_scheduler_t::preempt(gc_request_t * req) {
-    assert(req->status == GC_REQ_RUNNING);
+    assert(req != nullptr && "preempt: null request");
+    assert(req->status == GC_REQ_RUNNING && "preempt: request not in RUNNING state");
+    assert(gc_req_transition_valid(req->status, GC_REQ_PREEMPTED) &&
+           "preempt: invalid state transition");
     kv_mgr_.free(req->request_id);
     req->status = GC_REQ_PREEMPTED;
     req->num_computed_tokens = 0;
     req->num_preemptions++;
     waiting_push_front(req);
+    GC_LOG_REQ("preempt req=%s preemptions=%d", req->request_id.c_str(), req->num_preemptions);
     if (params_.enable_sched_trace) {
-        std::fprintf(stderr, "[sched] preempt req=%s preemptions=%d\n",
-                     req->request_id.c_str(), req->num_preemptions);
+        GC_LOG_SCHED("preempt req=%s preemptions=%d", req->request_id.c_str(), req->num_preemptions);
     }
 }
 
 void gc_scheduler_t::finish_request(gc_request_t * req, gc_req_status_t status) {
+    assert(req != nullptr && "finish_request: null request");
+    assert(gc_req_is_finished(status) && "finish_request: target status is not a finished status");
+    assert(gc_req_transition_valid(req->status, status) &&
+           "finish_request: invalid state transition");
     req->status = status;
     kv_mgr_.free(req->request_id);
     running_.erase(std::remove(running_.begin(), running_.end(), req), running_.end());
-    finished_req_ids_.insert(req->request_id);
+    finished_reqs_[req->request_id] = status;
 }
 
 gc_new_req_data_t gc_scheduler_t::make_new_req_data(const gc_request_t * req) const {
@@ -153,6 +160,7 @@ gc_cached_req_entry_t gc_scheduler_t::make_cached_entry(
                            req->prompt_token_ids.begin(), req->prompt_token_ids.end());
     e.all_token_ids.insert(e.all_token_ids.end(),
                            req->output_token_ids.begin(), req->output_token_ids.end());
+    e.sampling_params = req->sampling_params;
     return e;
 }
 
@@ -193,6 +201,12 @@ gc_request_t * gc_scheduler_t::preempt_one(
 
     if (victim == protect) return nullptr;
 
+    // Defensive: victim must be in RUNNING state when preempted.
+    assert(victim->status == GC_REQ_RUNNING &&
+           "preempt_one: victim is not in RUNNING state");
+    assert(!gc_req_is_finished(victim->status) &&
+           "preempt_one: attempt to preempt an already-finished request");
+
     // Un-schedule victim if already scheduled this step.
     auto ns_it = out.num_scheduled_tokens.find(victim->request_id);
     if (ns_it != out.num_scheduled_tokens.end()) {
@@ -217,8 +231,8 @@ gc_request_t * gc_scheduler_t::preempt_one(
 
 gc_sched_output_t gc_scheduler_t::schedule() {
     gc_sched_output_t out;
-    out.finished_req_ids = std::move(finished_req_ids_);
-    finished_req_ids_.clear();
+    out.finished_reqs = std::move(finished_reqs_);
+    finished_reqs_.clear();
 
     int token_budget = params_.max_num_tokens;
 
@@ -252,10 +266,8 @@ gc_sched_output_t gc_scheduler_t::schedule() {
         out.metrics.num_decode_tokens += 1;
         token_budget -= 1;
 
-        if (params_.enable_sched_trace) {
-            std::fprintf(stderr, "[sched] decode req=%s computed=%d budget_left=%d\n",
-                         req->request_id.c_str(), req->num_computed_tokens, token_budget);
-        }
+        GC_LOG_SCHED("decode req=%s computed=%d budget_left=%d",
+                     req->request_id.c_str(), req->num_computed_tokens, token_budget);
     }
 
     // ── P2: Prefill continuations ─────────────────────────────────────────────
@@ -288,10 +300,8 @@ gc_sched_output_t gc_scheduler_t::schedule() {
         out.metrics.num_prefill_tokens += num_new;
         token_budget -= num_new;
 
-        if (params_.enable_sched_trace) {
-            std::fprintf(stderr, "[sched] prefill-cont req=%s computed=%d chunk=%d budget_left=%d\n",
-                         req->request_id.c_str(), req->num_computed_tokens, num_new, token_budget);
-        }
+        GC_LOG_SCHED("prefill-cont req=%s computed=%d chunk=%d budget_left=%d",
+                     req->request_id.c_str(), req->num_computed_tokens, num_new, token_budget);
     }
 
 done_running:
@@ -328,6 +338,8 @@ done_running:
         if (rb == nullptr) break;
 
         waiting_pop();
+        assert(gc_req_transition_valid(req->status, GC_REQ_RUNNING) &&
+               "schedule: invalid WAITING→RUNNING transition");
         req->status = GC_REQ_RUNNING;
         req->num_computed_tokens = num_computed;
         running_.push_back(req);
@@ -345,10 +357,8 @@ done_running:
         out.metrics.num_new_admitted += 1;
         token_budget -= num_new;
 
-        if (params_.enable_sched_trace) {
-            std::fprintf(stderr, "[sched] admit-run req=%s prefix_hit=%d chunk=%d budget_left=%d\n",
-                         req->request_id.c_str(), num_computed, num_new, token_budget);
-        }
+        GC_LOG_SCHED("admit-run req=%s prefix_hit=%d chunk=%d budget_left=%d",
+                     req->request_id.c_str(), num_computed, num_new, token_budget);
     }
 
 build_output:
@@ -363,15 +373,12 @@ build_output:
     out.metrics.num_preempted = (int)out.preempted_req_ids.size();
     out.metrics.kv_usage      = kv_mgr_.usage();
 
-    if (params_.enable_sched_trace) {
-        std::fprintf(stderr,
-            "[sched] step: running=%d waiting=%d decode_tok=%d prefill_tok=%d "
-            "new_admitted=%d preempted=%d kv=%.2f%%\n",
-            out.metrics.num_running, out.metrics.num_waiting,
-            out.metrics.num_decode_tokens, out.metrics.num_prefill_tokens,
-            out.metrics.num_new_admitted, out.metrics.num_preempted,
-            out.metrics.kv_usage * 100.f);
-    }
+    GC_LOG_SCHED("step: running=%d waiting=%d decode_tok=%d prefill_tok=%d "
+                 "new_admitted=%d preempted=%d kv=%.2f%%",
+                 out.metrics.num_running, out.metrics.num_waiting,
+                 out.metrics.num_decode_tokens, out.metrics.num_prefill_tokens,
+                 out.metrics.num_new_admitted, out.metrics.num_preempted,
+                 out.metrics.kv_usage * 100.f);
 
     // NOTE: num_computed_tokens is NOT advanced here.
     // It is advanced in update_computed_tokens(), called by the engine AFTER
@@ -409,20 +416,43 @@ void gc_scheduler_t::update_from_output(
         bool stop = false;
         gc_req_status_t fin_status = GC_REQ_FINISHED_STOPPED;
 
-        if (!req->sampling_params.ignore_eos &&
+        // EOS-by-id
+        if (!stop &&
+            !req->sampling_params.ignore_eos &&
             req->sampling_params.eos_token_id >= 0 &&
             tok == req->sampling_params.eos_token_id) {
             stop = true;
-        } else if (req->num_output_tokens() >= req->max_tokens()) {
+        }
+
+        // Multi-token stop sequences: check if the tail of output_token_ids
+        // matches any configured stop sequence.
+        if (!stop && !req->sampling_params.stop_token_ids.empty()) {
+            const auto & out_toks = req->output_token_ids;
+            for (const auto & seq : req->sampling_params.stop_token_ids) {
+                if (seq.empty()) continue;
+                const int slen = (int)seq.size();
+                const int olen = (int)out_toks.size();
+                if (olen < slen) continue;
+                bool match = true;
+                for (int si = 0; si < slen; ++si) {
+                    if (out_toks[(size_t)(olen - slen + si)] != seq[(size_t)si]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) { stop = true; break; }
+            }
+        }
+
+        // Max-tokens budget
+        if (!stop && req->num_output_tokens() >= req->max_tokens()) {
             stop = true;
             fin_status = GC_REQ_FINISHED_LENGTH_CAPPED;
         }
 
         if (stop) {
-            if (params_.enable_sched_trace) {
-                std::fprintf(stderr, "[sched] finish req=%s out_tokens=%d reason=%d\n",
-                             req_id.c_str(), req->num_output_tokens(), (int)fin_status);
-            }
+            GC_LOG_REQ("finish req=%s out_tokens=%d reason=%d",
+                       req_id.c_str(), req->num_output_tokens(), (int)fin_status);
             finish_request(req, fin_status);
         }
     }

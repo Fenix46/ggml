@@ -49,23 +49,23 @@ void gc_ggml_model_runner_t::apply_repetition_penalty(std::vector<float> & logit
     }
 }
 
-int32_t gc_ggml_model_runner_t::sample_token(std::vector<float> logits) {
-    // temperature
-    for (float & l : logits) l /= cfg_.temperature;
+int32_t gc_ggml_model_runner_t::sample_token_with_params(
+        std::vector<float> logits, float temperature, int top_k, float top_p) {
+    const int vocab = (int)logits.size();
 
-    // top-k filtering
-    std::vector<int> idx((size_t)cfg_.vocab_size);
+    // Temperature scaling (clamp to avoid div-by-zero)
+    if (temperature <= 0.0f) temperature = 1e-6f;
+    for (float & l : logits) l /= temperature;
+
+    // Top-k: restrict to top k candidates
+    std::vector<int> idx((size_t)vocab);
     std::iota(idx.begin(), idx.end(), 0);
-    std::partial_sort(
-        idx.begin(),
-        idx.begin() + (cfg_.top_k > 0 ? cfg_.top_k : cfg_.vocab_size),
-        idx.end(),
+    const int k = (top_k > 0 && top_k < vocab) ? top_k : vocab;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
         [&](int a, int b) { return logits[(size_t)a] > logits[(size_t)b]; });
-
-    const int k = cfg_.top_k > 0 ? cfg_.top_k : cfg_.vocab_size;
     idx.resize((size_t)k);
 
-    // stable softmax on candidate set
+    // Stable softmax over candidates
     float max_l = -std::numeric_limits<float>::infinity();
     for (int i : idx) max_l = std::max(max_l, logits[(size_t)i]);
 
@@ -80,13 +80,13 @@ int32_t gc_ggml_model_runner_t::sample_token(std::vector<float> logits) {
     if (sum <= 0.0f) return idx.front();
     for (float & p : probs) p /= sum;
 
-    // top-p truncation
-    if (cfg_.top_p < 1.0f) {
+    // Top-p truncation (nucleus sampling)
+    if (top_p < 1.0f) {
         float cum = 0.0f;
         size_t keep = 0;
         for (; keep < probs.size(); ++keep) {
             cum += probs[keep];
-            if (cum >= cfg_.top_p) break;
+            if (cum >= top_p) break;
         }
         keep = std::min(keep + 1, probs.size());
         idx.resize(keep);
@@ -98,6 +98,11 @@ int32_t gc_ggml_model_runner_t::sample_token(std::vector<float> logits) {
 
     std::discrete_distribution<size_t> dist(probs.begin(), probs.end());
     return idx[dist(rng_)];
+}
+
+int32_t gc_ggml_model_runner_t::sample_token(std::vector<float> logits) {
+    return sample_token_with_params(std::move(logits),
+                                    cfg_.temperature, cfg_.top_k, cfg_.top_p);
 }
 
 gc_model_output_t gc_ggml_model_runner_t::execute(const gc_batch_t & batch) {
@@ -115,22 +120,48 @@ gc_model_output_t gc_ggml_model_runner_t::execute(const gc_batch_t & batch) {
 
         if (e.is_prefill) {
             out.sampled_tokens.push_back(-1);
+            const int win = e.sampling_params.repetition_window > 0
+                            ? e.sampling_params.repetition_window : cfg_.repetition_window;
             st.recent_tokens.insert(st.recent_tokens.end(), e.token_ids.begin(), e.token_ids.end());
-            if (st.recent_tokens.size() > (size_t)cfg_.repetition_window) {
+            if ((int)st.recent_tokens.size() > win) {
                 st.recent_tokens.erase(
                     st.recent_tokens.begin(),
-                    st.recent_tokens.end() - cfg_.repetition_window);
+                    st.recent_tokens.end() - win);
             }
             continue;
         }
 
+        // Use per-request params when set, fall back to global config.
+        const float temperature = (e.sampling_params.temperature > 0.0f)
+                                  ? e.sampling_params.temperature : cfg_.temperature;
+        const int   top_k       = (e.sampling_params.top_k >= -1 && e.sampling_params.top_k != 0)
+                                  ? e.sampling_params.top_k : cfg_.top_k;
+        const float top_p       = (e.sampling_params.top_p > 0.0f && e.sampling_params.top_p <= 1.0f)
+                                  ? e.sampling_params.top_p : cfg_.top_p;
+        const float rep_pen     = (e.sampling_params.repetition_penalty >= 1.0f)
+                                  ? e.sampling_params.repetition_penalty : cfg_.repetition_penalty;
+        const int   rep_win     = (e.sampling_params.repetition_window > 0)
+                                  ? e.sampling_params.repetition_window : cfg_.repetition_window;
+
         auto logits = build_logits(e, st);
-        apply_repetition_penalty(logits, st);
-        const int32_t tok = sample_token(std::move(logits));
+
+        // Repetition penalty with per-request window
+        if (rep_pen > 1.0f && !st.recent_tokens.empty()) {
+            const size_t window = std::min(st.recent_tokens.size(), (size_t)rep_win);
+            for (size_t i = st.recent_tokens.size() - window; i < st.recent_tokens.size(); ++i) {
+                const int32_t tok_id = st.recent_tokens[i];
+                if (tok_id < 0 || tok_id >= cfg_.vocab_size) continue;
+                float & l = logits[(size_t)tok_id];
+                if (l > 0.0f) l /= rep_pen;
+                else l *= rep_pen;
+            }
+        }
+
+        const int32_t tok = sample_token_with_params(std::move(logits), temperature, top_k, top_p);
         out.sampled_tokens.push_back(tok);
 
         st.recent_tokens.push_back(tok);
-        if (st.recent_tokens.size() > (size_t)cfg_.repetition_window) {
+        if ((int)st.recent_tokens.size() > rep_win) {
             st.recent_tokens.erase(st.recent_tokens.begin());
         }
         st.step_count++;
@@ -143,4 +174,8 @@ gc_model_output_t gc_ggml_model_runner_t::execute(const gc_batch_t & batch) {
     }
 
     return out;
+}
+
+void gc_ggml_model_runner_t::release_request(const std::string & req_id) {
+    req_state_.erase(req_id);
 }

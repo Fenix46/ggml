@@ -1,4 +1,5 @@
 #include "gc_graph_runner.h"
+#include "gc_debug.h"
 
 #include "gc_arch.h"
 #include "gc_attention.h"
@@ -112,7 +113,7 @@ void gc_graph_runner_t::destroy() {
     if (inp_buf_) { ggml_backend_buffer_free(inp_buf_); inp_buf_ = nullptr; }
     if (inp_ctx_) { ggml_free(inp_ctx_); inp_ctx_ = nullptr; }
     kv_pool_.free();
-    if (backend_ && !backend_is_cpu_) { ggml_backend_free(backend_); }
+    // backend_ and backend_cpu_ always point to the same CPU backend object now.
     if (backend_cpu_) { ggml_backend_free(backend_cpu_); }
     backend_     = nullptr;
     backend_cpu_ = nullptr;
@@ -143,31 +144,35 @@ bool gc_graph_runner_t::init() {
     if (!w_tok_embd_) { err_ = "missing token_embd.weight"; return false; }
     if (!w_output_)   { w_output_ = w_tok_embd_; }
     w_output_norm_ = loader_->find_weight(gc_tn(arch, GC_TENSOR_OUTPUT_NORM, "weight").c_str());
+    fprintf(stderr, "[gc_graph_runner] weights: tok_embd=%s output=%s output_norm=%s\n",
+            gc_tn(arch, GC_TENSOR_TOKEN_EMBD, "weight").c_str(),
+            w_output_ == w_tok_embd_ ? "(tied=tok_embd)" : gc_tn(arch, GC_TENSOR_OUTPUT, "weight").c_str(),
+            w_output_norm_ ? gc_tn(arch, GC_TENSOR_OUTPUT_NORM, "weight").c_str() : "(missing)");
 
     if (w_tok_embd_->tensor->ne[0] != (int64_t)hp_.n_embd) {
         err_ = "token_embd dim mismatch vs n_embd"; return false;
     }
 
     // ── Backend selection ────────────────────────────────────────────────────
-    // Always create a CPU backend (needed for input tensors and fallback ops).
+    // Always create a CPU backend (needed for input tensors and sampling).
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) { err_ = "CPU backend init failed"; return false; }
     ggml_backend_cpu_set_n_threads(backend_cpu_, cfg_.n_threads);
 
-    // Try to find a GPU/accelerator backend first.
-    backend_ = ggml_backend_init_best();
-    if (!backend_) {
-        // No accelerator: use CPU for everything.
-        backend_     = backend_cpu_;
+    if (cfg_.force_cpu) {
+        backend_        = backend_cpu_;
         backend_is_cpu_ = true;
-        fprintf(stderr, "[gc_graph_runner] No accelerator found, using CPU backend\n");
+        fprintf(stderr, "[gc_graph_runner] force_cpu=true, using CPU backend\n");
     } else {
-        const ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
-        const auto dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
-        backend_is_cpu_ = (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU ||
-                           dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL);
-        fprintf(stderr, "[gc_graph_runner] backend=%s  cpu_fallback=%s\n",
-                ggml_backend_name(backend_), backend_is_cpu_ ? "yes" : "no");
+        // Try to find a GPU/accelerator backend.
+        // NOTE: GPU backends require weights to be loaded into device memory.
+        // Since weights are currently mmap-backed (CPU host), using a GPU gallocr
+        // will crash when reserve tries to allocate Metal buffers for mmap tensors.
+        // Until weight upload to device is implemented, force CPU.
+        backend_        = backend_cpu_;
+        backend_is_cpu_ = true;
+        fprintf(stderr, "[gc_graph_runner] weights are mmap/CPU — using CPU backend "
+                        "(GPU will be enabled after device weight upload)\n");
     }
 
     // ── KV pool ───────────────────────────────────────────────────────────────
@@ -187,16 +192,11 @@ bool gc_graph_runner_t::init() {
     }
 
     // ── Graph allocator ───────────────────────────────────────────────────────
-    // Two-buffer gallocr: primary backend (GPU/Metal/CPU) + CPU for input copies.
-    if (backend_is_cpu_) {
-        galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
-    } else {
-        ggml_backend_buffer_type_t bufts[2] = {
-            ggml_backend_get_default_buffer_type(backend_),
-            ggml_backend_get_default_buffer_type(backend_cpu_),
-        };
-        galloc_ = ggml_gallocr_new_n(bufts, 2);
-    }
+    // Single-buffer gallocr using the primary backend's buffer type.
+    // Weight tensors are mmap-backed (CPU host memory) with pre-set data pointers;
+    // gallocr skips them during layout (no_alloc tensors with existing data are
+    // left in place). Intermediate tensors get allocated in the primary backend.
+    galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!galloc_) { err_ = "gallocr init failed"; return false; }
 
     return true;
@@ -454,49 +454,59 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
         }
         stats_.kv_slots_written += (uint64_t)(n_new);
 
-        // ── KV read: gather all n_ctx slots for attention ─────────────────────
-        // Build K_full and V_full tensors shaped [row_size, n_ctx] by gathering
-        // the physical slots in logical order.
-        //
-        // NOTE: This is an on-device gather — all ggml_cpy nodes run on the
-        // primary backend. No CPU memcpy occurs here.
-        //
-        // FUTURE OPT: replace with a paged-attn GGML op that reads the block
-        // table on-device and avoids building O(n_ctx) copy nodes per layer.
+        ggml_tensor * Q3 = Qcur;
+        ggml_tensor * K3 = nullptr;
+        ggml_tensor * V3 = nullptr;
 
-        ggml_tensor * K_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
-            (int64_t)(nkv * n_embd_hq), (int64_t)n_ctx);
-        ggml_set_name(K_full, "K_gathered");
+        if (e.num_computed == 0 && n_ctx == n_new) {
+            // Initial prefill can attend directly over the just-computed K/V.
+            // Do not read back from the persistent KV pool in the same graph:
+            // GGML does not model cpy-to-view side effects as dependencies, so
+            // a gather from the pool may be scheduled before the writes.
+            K3 = Kcur;
+            V3 = Vcur;
+        } else {
+            // ── KV read: gather all n_ctx slots for attention ─────────────────
+            // Build K_full and V_full tensors shaped [row_size, n_ctx] by
+            // gathering the physical slots in logical order.
+            //
+            // FIXME: for decode/chunked prefill this still has no explicit graph
+            // dependency on same-step KV writes. Current-token K/V should be
+            // wired directly, or replaced by a real paged-attention op.
+            ggml_tensor * K_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                (int64_t)(nkv * n_embd_hq), (int64_t)n_ctx);
+            ggml_set_name(K_full, "K_gathered");
 
-        ggml_tensor * V_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
-            (int64_t)(nkv * n_embd_hv), (int64_t)n_ctx);
-        ggml_set_name(V_full, "V_gathered");
+            ggml_tensor * V_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                (int64_t)(nkv * n_embd_hv), (int64_t)n_ctx);
+            ggml_set_name(V_full, "V_gathered");
 
-        for (int t = 0; t < n_ctx; ++t) {
-            const size_t slot_idx = kv_pool_.token_slot_idx(e.block_ids, t);
+            for (int t = 0; t < n_ctx; ++t) {
+                const size_t slot_idx = kv_pool_.token_slot_idx(e.block_ids, t);
 
-            const size_t src_off_k = slot_idx * (size_t)(nkv * n_embd_hq) * sizeof(float);
-            const size_t src_off_v = slot_idx * (size_t)(nkv * n_embd_hv) * sizeof(float);
-            const size_t dst_off_k = (size_t)t   * (size_t)(nkv * n_embd_hq) * sizeof(float);
-            const size_t dst_off_v = (size_t)t   * (size_t)(nkv * n_embd_hv) * sizeof(float);
+                const size_t src_off_k = slot_idx * (size_t)(nkv * n_embd_hq) * sizeof(float);
+                const size_t src_off_v = slot_idx * (size_t)(nkv * n_embd_hv) * sizeof(float);
+                const size_t dst_off_k = (size_t)t   * (size_t)(nkv * n_embd_hq) * sizeof(float);
+                const size_t dst_off_v = (size_t)t   * (size_t)(nkv * n_embd_hv) * sizeof(float);
 
-            ggml_tensor * ks = ggml_view_2d(ctx, kv_pool_.k[il],
-                (int64_t)(nkv * n_embd_hq), 1, kv_pool_.k[il]->nb[1], src_off_k);
-            ggml_tensor * kd = ggml_view_2d(ctx, K_full,
-                (int64_t)(nkv * n_embd_hq), 1, K_full->nb[1],          dst_off_k);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, ks, kd));
+                ggml_tensor * ks = ggml_view_2d(ctx, kv_pool_.k[il],
+                    (int64_t)(nkv * n_embd_hq), 1, kv_pool_.k[il]->nb[1], src_off_k);
+                ggml_tensor * kd = ggml_view_2d(ctx, K_full,
+                    (int64_t)(nkv * n_embd_hq), 1, K_full->nb[1],          dst_off_k);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, ks, kd));
 
-            ggml_tensor * vs = ggml_view_2d(ctx, kv_pool_.v[il],
-                (int64_t)(nkv * n_embd_hv), 1, kv_pool_.v[il]->nb[1], src_off_v);
-            ggml_tensor * vd = ggml_view_2d(ctx, V_full,
-                (int64_t)(nkv * n_embd_hv), 1, V_full->nb[1],          dst_off_v);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, vs, vd));
+                ggml_tensor * vs = ggml_view_2d(ctx, kv_pool_.v[il],
+                    (int64_t)(nkv * n_embd_hv), 1, kv_pool_.v[il]->nb[1], src_off_v);
+                ggml_tensor * vd = ggml_view_2d(ctx, V_full,
+                    (int64_t)(nkv * n_embd_hv), 1, V_full->nb[1],          dst_off_v);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, vs, vd));
+            }
+
+            K3 = ggml_reshape_3d(ctx, K_full, n_embd_hq, nkv, (int64_t)n_ctx);
+            V3 = ggml_reshape_3d(ctx, V_full, n_embd_hv, nkv, (int64_t)n_ctx);
         }
 
         // ── Attention MHA ─────────────────────────────────────────────────────
-        ggml_tensor * Q3 = Qcur;
-        ggml_tensor * K3 = ggml_reshape_3d(ctx, K_full, n_embd_hq, nkv, (int64_t)n_ctx);
-        ggml_tensor * V3 = ggml_reshape_3d(ctx, V_full, n_embd_hv, nkv, (int64_t)n_ctx);
 
         gc_attn_params_t ap_full = ap;
         ap_full.n_tokens = (int64_t)n_new;
@@ -566,25 +576,29 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
 // ── Sampling ──────────────────────────────────────────────────────────────────
 
 void gc_graph_runner_t::apply_rep_penalty(std::vector<float> & logits,
-                                           const req_state_t & st) const {
-    if (cfg_.repetition_penalty <= 1.0f || st.recent_tokens.empty()) return;
-    const size_t window = std::min(st.recent_tokens.size(), (size_t)cfg_.repetition_window);
+                                           const req_state_t & st,
+                                           float rep_penalty, int rep_window) const {
+    if (rep_penalty <= 1.0f || st.recent_tokens.empty()) return;
+    const size_t window = std::min(st.recent_tokens.size(), (size_t)rep_window);
     for (size_t i = st.recent_tokens.size() - window; i < st.recent_tokens.size(); ++i) {
         const int32_t tok = st.recent_tokens[i];
         if (tok < 0 || tok >= (int32_t)logits.size()) continue;
         float & l = logits[(size_t)tok];
-        l = (l > 0.0f) ? l / cfg_.repetition_penalty : l * cfg_.repetition_penalty;
+        l = (l > 0.0f) ? l / rep_penalty : l * rep_penalty;
     }
 }
 
-int32_t gc_graph_runner_t::sample(std::vector<float> logits) {
+int32_t gc_graph_runner_t::sample(std::vector<float> logits,
+                                   float temperature, int top_k, float top_p) {
     const int vocab = (int)logits.size();
 
-    for (float & l : logits) l /= cfg_.temperature;
+    // Temperature scaling (clamp to avoid div-by-zero)
+    if (temperature <= 0.0f) temperature = 1e-6f;
+    for (float & l : logits) l /= temperature;
 
     std::vector<int> idx((size_t)vocab);
     std::iota(idx.begin(), idx.end(), 0);
-    const int k = (cfg_.top_k > 0 && cfg_.top_k < vocab) ? cfg_.top_k : vocab;
+    const int k = (top_k > 0 && top_k < vocab) ? top_k : vocab;
     std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
         [&](int a, int b) { return logits[(size_t)a] > logits[(size_t)b]; });
     idx.resize((size_t)k);
@@ -603,12 +617,12 @@ int32_t gc_graph_runner_t::sample(std::vector<float> logits) {
     if (sum <= 0.0f) return idx.front();
     for (float & p : probs) p /= sum;
 
-    if (cfg_.top_p < 1.0f) {
+    if (top_p < 1.0f) {
         float cum = 0.0f;
         size_t keep = 0;
         for (; keep < probs.size(); ++keep) {
             cum += probs[keep];
-            if (cum >= cfg_.top_p) break;
+            if (cum >= top_p) break;
         }
         keep = std::min(keep + 1, probs.size());
         idx.resize(keep);
@@ -650,6 +664,20 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
 
         const int n_new = (int)e.token_ids.size();
         const int n_ctx = e.num_computed + n_new;
+
+        // Diagnostic: log first step details.
+        if (stats_.steps_executed == 0) {
+            fprintf(stderr, "[gc_graph_runner] first step: req=%s n_new=%d n_ctx=%d num_computed=%d is_prefill=%d is_last_prefill=%d\n",
+                    e.req_id.c_str(), n_new, n_ctx, e.num_computed, (int)e.is_prefill, (int)e.is_last_prefill);
+            fprintf(stderr, "[gc_graph_runner] first step tokens:");
+            for (int i = 0; i < std::min(n_new, 20); ++i)
+                fprintf(stderr, " %d", e.token_ids[i]);
+            fprintf(stderr, " ...\n");
+            fprintf(stderr, "[gc_graph_runner] first step positions:");
+            for (int i = 0; i < std::min(n_new, 20); ++i)
+                fprintf(stderr, " %d", e.position_ids[i]);
+            fprintf(stderr, " ...\n");
+        }
 
         // ── Pre-execution assertions ──────────────────────────────────────────
         // Assert no writes to null block (block_id=0 is the zero-pad sentinel).
@@ -712,16 +740,26 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             }
 
             // ── Allocate compute buffers ──────────────────────────────────────
-            // ggml_gallocr_alloc_graph reuses existing buffers if large enough.
-            // After this call every tensor in gf (including kq_mask) has a buffer.
+            // The graph topology changes each step (n_new, n_ctx vary), so the
+            // gallocr may need to reserve a new layout. We always call reserve
+            // first to handle topology changes, then alloc.
+            if (!ggml_gallocr_reserve(galloc_, gf)) {
+                fprintf(stderr, "[gc_graph_runner] gallocr reserve failed (req=%s n_new=%d n_ctx=%d)\n",
+                        e.req_id.c_str(), n_new, n_ctx);
+                ggml_free(ctx);
+                out.sampled_tokens.push_back(-1);
+                goto next_entry;
+            }
             if (!ggml_gallocr_alloc_graph(galloc_, gf)) {
+                // reserve succeeded but alloc still failed — fatal
+                fprintf(stderr, "[gc_graph_runner] gallocr alloc failed after reserve (req=%s)\n",
+                        e.req_id.c_str());
                 stats_.graph_alloc_resized++;
                 ggml_free(ctx);
                 out.sampled_tokens.push_back(-1);
                 goto next_entry;
-            } else {
-                stats_.graph_alloc_reused++;
             }
+            stats_.graph_alloc_reused++;
 
             // ── Write causal mask (now kq_mask has a buffer) ──────────────────
             if (kq_mask) {
@@ -759,27 +797,61 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
                 logits.data(),
                 (size_t)(n_new - 1) * (size_t)vocab * sizeof(float),
                 (size_t)vocab * sizeof(float));
+            last_logits_ = logits;
 
             ggml_free(ctx);
 
-            // Track prompt tokens for repetition penalty.
+            // Diagnostic: log top-5 logit tokens on first two steps.
+            if (stats_.steps_executed <= 2) {
+                std::vector<int> tidx((size_t)vocab);
+                std::iota(tidx.begin(), tidx.end(), 0);
+                std::partial_sort(tidx.begin(), tidx.begin() + 5, tidx.end(),
+                    [&](int a, int b){ return logits[(size_t)a] > logits[(size_t)b]; });
+                fprintf(stderr, "[gc_graph_runner] step=%llu top-5 (req=%s n_new=%d n_ctx=%d): ",
+                        (unsigned long long)stats_.steps_executed, e.req_id.c_str(), n_new, n_ctx);
+                for (int i = 0; i < 5; ++i)
+                    fprintf(stderr, "tok=%d(%.2f) ", tidx[i], logits[(size_t)tidx[i]]);
+                fprintf(stderr, "\n");
+            }
+
+            // Track all processed tokens for repetition penalty.
+            // rep_win computed above using per-request params.
             st.recent_tokens.insert(st.recent_tokens.end(),
                                     e.token_ids.begin(), e.token_ids.end());
-            if (st.recent_tokens.size() > (size_t)cfg_.repetition_window) {
-                st.recent_tokens.erase(st.recent_tokens.begin(),
-                    st.recent_tokens.end() - cfg_.repetition_window);
+            {
+                const int rw = (e.sampling_params.repetition_window > 0)
+                               ? e.sampling_params.repetition_window : cfg_.repetition_window;
+                if ((int)st.recent_tokens.size() > rw) {
+                    st.recent_tokens.erase(st.recent_tokens.begin(),
+                        st.recent_tokens.end() - rw);
+                }
             }
+
+            // Use per-request params when set, fall back to global cfg_.
+            const float temperature = (e.sampling_params.temperature > 0.0f)
+                                      ? e.sampling_params.temperature
+                                      : cfg_.temperature;
+            const int   top_k       = (e.sampling_params.top_k >= -1 && e.sampling_params.top_k != 0)
+                                      ? e.sampling_params.top_k : cfg_.top_k;
+            const float top_p       = (e.sampling_params.top_p > 0.0f && e.sampling_params.top_p <= 1.0f)
+                                      ? e.sampling_params.top_p : cfg_.top_p;
+            const float rep_pen     = (e.sampling_params.repetition_penalty >= 1.0f)
+                                      ? e.sampling_params.repetition_penalty
+                                      : cfg_.repetition_penalty;
+            const int   rep_win     = (e.sampling_params.repetition_window > 0)
+                                      ? e.sampling_params.repetition_window
+                                      : cfg_.repetition_window;
 
             // ── Sample or suppress ────────────────────────────────────────────
             if (e.is_prefill && !e.is_last_prefill) {
                 // Mid-prefill: no output token yet.
                 out.sampled_tokens.push_back(-1);
             } else {
-                apply_rep_penalty(logits, st);
-                const int32_t tok = sample(std::move(logits));
+                apply_rep_penalty(logits, st, rep_pen, rep_win);
+                const int32_t tok = sample(std::move(logits), temperature, top_k, top_p);
                 out.sampled_tokens.push_back(tok);
                 st.recent_tokens.push_back(tok);
-                if (st.recent_tokens.size() > (size_t)cfg_.repetition_window) {
+                if ((int)st.recent_tokens.size() > rep_win) {
                     st.recent_tokens.erase(st.recent_tokens.begin());
                 }
             }
@@ -791,7 +863,8 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
         (void)n_ctx;  // suppress unused warning when assertions disabled
     }
 
-    // Purge state for completed requests.
+    // Purge state for completed/absent requests.
+    // Handles both natural completion and abort (release_request also erases immediately).
     for (auto it = req_state_.begin(); it != req_state_.end();) {
         it = active.count(it->first) ? std::next(it) : req_state_.erase(it);
     }
@@ -808,4 +881,8 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
     }
 
     return out;
+}
+
+void gc_graph_runner_t::release_request(const std::string & req_id) {
+    req_state_.erase(req_id);
 }

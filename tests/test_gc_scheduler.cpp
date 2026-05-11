@@ -201,7 +201,8 @@ static void test_scheduler_finish_eos() {
     CHECK(sched.num_running() == 0);
 
     auto out = sched.schedule();
-    CHECK(out.finished_req_ids.count("r0") == 1);
+    CHECK(out.finished_reqs.count("r0") == 1);
+    CHECK(out.finished_reqs.at("r0") == GC_REQ_FINISHED_STOPPED);
 }
 
 static void test_scheduler_finish_max_tokens() {

@@ -57,6 +57,8 @@ struct gc_cached_req_entry_t {
     int32_t              last_token          = -1; // last generated token (decode step input)
     // Full token sequence: prompt_token_ids + output_token_ids so far.
     std::vector<int32_t> all_token_ids;
+    // Per-request sampling params (forwarded verbatim to the batch entry).
+    gc_sampling_params_t sampling_params;
 };
 
 struct gc_sched_output_t {
@@ -67,8 +69,9 @@ struct gc_sched_output_t {
     std::unordered_map<std::string, int> num_scheduled_tokens;
     int total_scheduled_tokens = 0;
 
-    // Requests that finished between previous and current step
-    std::unordered_set<std::string> finished_req_ids;
+    // Requests that finished between previous and current step.
+    // Maps req_id → finish reason (EOS / length-capped / aborted).
+    std::unordered_map<std::string, gc_req_status_t> finished_reqs;
 
     // Requests preempted this step
     std::unordered_set<std::string> preempted_req_ids;
@@ -172,8 +175,9 @@ private:
 
     std::vector<gc_request_t *> running_;   // ordered: index 0 = oldest
 
-    // Requests finished since last schedule() call (to include in output)
-    std::unordered_set<std::string> finished_req_ids_;
+    // Requests finished since last schedule() call (to include in output).
+    // Maps req_id → finish reason.
+    std::unordered_map<std::string, gc_req_status_t> finished_reqs_;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

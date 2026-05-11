@@ -8,12 +8,17 @@ target_include_directories(gc_server PUBLIC
     ${CMAKE_SOURCE_DIR}/src/engine
     ${CMAKE_SOURCE_DIR}/src/scheduler
     ${CMAKE_SOURCE_DIR}/src/kvcache
+    ${CMAKE_SOURCE_DIR}/src/chat
 )
 
-target_link_libraries(gc_server PUBLIC gc_engine)
+target_link_libraries(gc_server PUBLIC gc_engine gc_chat)
 
 add_executable(gc_server_main
     gc_server_main.cpp
+)
+
+target_include_directories(gc_server_main PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/chat
 )
 
 target_link_libraries(gc_server_main PUBLIC
@@ -22,6 +27,7 @@ target_link_libraries(gc_server_main PUBLIC
     gc_loader
     gc_arch
     gc_vocab
+    gc_chat
 )
 
 set_target_properties(gc_server PROPERTIES

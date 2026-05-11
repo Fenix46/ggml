@@ -360,6 +360,7 @@ int32_t gc_chat_apply_template(
         }
         if (add_ass) ss << "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>";
     } else if (tmpl == GC_CHAT_TEMPLATE_LLAMA_3) {
+        ss << "<|begin_of_text|>";
         for (auto msg : chat) {
             ss << "<|start_header_id|>" << msg->role << "<|end_header_id|>\n\n"
                << gc__chat_trim(msg->content) << "<|eot_id|>";

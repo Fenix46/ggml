@@ -94,6 +94,7 @@ static void test_llama3() {
         {"user",      "Hello"},
         {"assistant", "Hi there"},
     });
+    CHECK(out.rfind("<|begin_of_text|>", 0) == 0);
     CHECK_CONTAINS(out, "<|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>");
     CHECK_CONTAINS(out, "<|start_header_id|>assistant<|end_header_id|>\n\nHi there<|eot_id|>");
 }

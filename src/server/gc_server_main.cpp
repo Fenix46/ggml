@@ -1,4 +1,5 @@
 #include "gc_server.h"
+#include "gc_chat.h"
 #include "gc_engine.h"
 #include "gc_graph_runner.h"
 #include "gc_gguf_loader.h"
@@ -118,30 +119,41 @@ int main(int argc, char ** argv) {
         runner_cfg.repetition_window  = 64;
         auto graph_runner = std::make_unique<gc_graph_runner_t>(&loader, hp, runner_cfg);
         if (!graph_runner->ok()) {
-            std::fprintf(stderr, "warning: graph runner init failed (%s) — using synthetic runner\n",
+            std::fprintf(stderr, "error: graph runner init failed (%s)\n"
+                         "refusing to serve with synthetic logits; fix the real forward path first\n",
                          graph_runner->error().c_str());
-            gc_ggml_model_runner_t::config_t synth_cfg;
-            synth_cfg.num_layers = hp.n_layer > 0 ? (int)hp.n_layer : 1;
-            synth_cfg.vocab_size = std::max(2, (int)vocab.n_tokens());
-            runner_holder = std::make_unique<gc_ggml_model_runner_t>(synth_cfg);
-        } else {
-            runner_holder = std::move(graph_runner);
+            return 1;
         }
+        runner_holder = std::move(graph_runner);
         gc_engine_t engine(ep, runner_holder.get());
 
         const int32_t eos_id = vocab.token_eos() == GC_TOKEN_NULL ? 2 : vocab.token_eos();
         gc_engine_server_runtime_t runtime(&engine, [&vocab](const std::string & text) {
-            auto toks = vocab.tokenize(text, false, false);
+            // parse_special=true so chat template tokens like <|begin_of_text|>,
+            // <|start_header_id|>, <|eot_id|> are resolved to their token IDs.
+            auto toks = vocab.tokenize(text, /*add_special=*/false, /*parse_special=*/true);
             if (toks.empty()) {
                 toks.push_back(1);
             }
             return toks;
         }, eos_id);
 
+        // Read chat template from GGUF metadata and detect template type.
+        gc_chat_template_t chat_tmpl = GC_CHAT_TEMPLATE_UNKNOWN;
+        {
+            std::string raw_tmpl;
+            if (loader.get_str("tokenizer.chat_template", raw_tmpl, false) && !raw_tmpl.empty()) {
+                chat_tmpl = gc_chat_detect_template(raw_tmpl);
+                std::fprintf(stderr, "chat_template: detected %s\n",
+                             chat_tmpl == GC_CHAT_TEMPLATE_UNKNOWN ? "unknown (fallback)" : "known");
+            }
+        }
+
         gc_server_params_t sp;
         sp.host = host;
         sp.port = port;
         sp.runtime = &runtime;
+        sp.chat_template = chat_tmpl;
         sp.detokenize_fn = [&vocab](int32_t tok) {
             std::string s = vocab.detokenize({tok}, false);
             if (s.empty()) {

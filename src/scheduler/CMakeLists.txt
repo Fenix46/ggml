@@ -6,6 +6,7 @@ add_library(gc_scheduler STATIC
 target_include_directories(gc_scheduler PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src/kvcache
+    ${CMAKE_SOURCE_DIR}/src/common
 )
 
 target_link_libraries(gc_scheduler PUBLIC gc_kvcache)

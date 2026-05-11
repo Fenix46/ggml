@@ -1,10 +1,11 @@
 #include "gc_server.h"
+#include "gc_chat.h"
 #include "gc_engine.h"
+#include "gc_request.h"
 
 #include "vendor/httplib.h"
 #include "vendor/json.hpp"
 
-#include <chrono>
 #include <ctime>
 #include <sstream>
 
@@ -12,15 +13,38 @@ using json = nlohmann::json;
 
 namespace {
 
-static std::string gc__extract_prompt(const json & in) {
-    std::ostringstream oss;
+static std::string gc__extract_prompt(const json & in, gc_chat_template_t tmpl) {
     const auto & msgs = in["messages"];
+
+    // Build gc_chat_message_t list from JSON.
+    // We keep the string storage alive in parallel vectors.
+    std::vector<std::string> roles, contents;
+    roles.reserve(msgs.size());
+    contents.reserve(msgs.size());
     for (const auto & m : msgs) {
         if (!m.is_object()) continue;
-        const std::string role = m.value("role", "");
-        const std::string content = m.value("content", "");
-        if (!role.empty() && !content.empty()) {
-            oss << role << ": " << content << "\n";
+        roles.push_back(m.value("role", ""));
+        contents.push_back(m.value("content", ""));
+    }
+
+    if (tmpl != GC_CHAT_TEMPLATE_UNKNOWN) {
+        std::vector<gc_chat_message_t>        msg_objs(roles.size());
+        std::vector<const gc_chat_message_t*> msg_ptrs(roles.size());
+        for (size_t i = 0; i < roles.size(); ++i) {
+            msg_objs[i] = { roles[i].c_str(), contents[i].c_str() };
+            msg_ptrs[i] = &msg_objs[i];
+        }
+        std::string out;
+        if (gc_chat_apply_template(tmpl, msg_ptrs, out, /*add_ass=*/true) > 0) {
+            return out;
+        }
+    }
+
+    // Fallback: plain concatenation
+    std::ostringstream oss;
+    for (size_t i = 0; i < roles.size(); ++i) {
+        if (!roles[i].empty() && !contents[i].empty()) {
+            oss << roles[i] << ": " << contents[i] << "\n";
         }
     }
     return oss.str();
@@ -157,9 +181,23 @@ std::vector<gc_server_token_event_t> gc_engine_server_runtime_t::step() {
     out.reserve(s.outputs.size());
     for (const auto & o : s.outputs) {
         gc_server_token_event_t ev;
-        ev.req_id = o.req_id;
-        ev.token = o.token;
+        ev.req_id   = o.req_id;
+        ev.token    = o.token;
         ev.finished = o.finished;
+        if (o.finished) {
+            switch (o.finish_reason) {
+                case GC_REQ_FINISHED_LENGTH_CAPPED:
+                    ev.finish_reason = "length";
+                    break;
+                case GC_REQ_FINISHED_ABORTED:
+                    ev.finish_reason = "abort";
+                    break;
+                case GC_REQ_FINISHED_STOPPED:
+                default:
+                    ev.finish_reason = "stop";
+                    break;
+            }
+        }
         out.push_back(ev);
     }
     return out;
@@ -208,7 +246,7 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
         gc_server_request_t reqv;
         reqv.id = "req-" + std::to_string(impl_->next_req_id.fetch_add(1));
         reqv.model = in["model"].get<std::string>();
-        reqv.prompt_text = gc__extract_prompt(in);
+        reqv.prompt_text = gc__extract_prompt(in, params_.chat_template);
         reqv.max_tokens = in.value("max_tokens", 16);
         if (reqv.max_tokens <= 0) reqv.max_tokens = 1;
         if (reqv.max_tokens > 4096) reqv.max_tokens = 4096;
@@ -233,8 +271,9 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                     std::string role_evt = "data: " + role_chunk.dump() + "\n\n";
                     sink.write(role_evt.data(), role_evt.size());
 
-                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(300);
                     bool finished = false;
+                    std::string final_reason = "stop";
                     while (std::chrono::steady_clock::now() < deadline && !finished) {
                         auto evs = impl_->runtime->step();
                         for (const auto & ev : evs) {
@@ -250,7 +289,10 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                                 std::string evt = "data: " + tok_chunk.dump() + "\n\n";
                                 sink.write(evt.data(), evt.size());
                             }
-                            finished = ev.finished;
+                            if (ev.finished) {
+                                finished = true;
+                                if (!ev.finish_reason.empty()) final_reason = ev.finish_reason;
+                            }
                         }
                         if (!finished) std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     }
@@ -260,7 +302,7 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                         {"object", "chat.completion.chunk"},
                         {"created", gc__unix_time_now()},
                         {"model", "gc-server"},
-                        {"choices", {{{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}}}
+                        {"choices", {{{"index", 0}, {"delta", json::object()}, {"finish_reason", final_reason}}}}
                     };
                     std::string end_evt = "data: " + end_chunk.dump() + "\n\n";
                     sink.write(end_evt.data(), end_evt.size());
@@ -275,8 +317,9 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
 
         std::string text;
         int completion_tokens = 0;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(300);
         bool finished = false;
+        std::string final_reason = "stop";
         while (std::chrono::steady_clock::now() < deadline && !finished) {
             auto evs = impl_->runtime->step();
             for (const auto & ev : evs) {
@@ -285,7 +328,10 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                     text += gc__token_to_text(ev.token, params_.detokenize_fn);
                     completion_tokens++;
                 }
-                finished = ev.finished;
+                if (ev.finished) {
+                    finished = true;
+                    if (!ev.finish_reason.empty()) final_reason = ev.finish_reason;
+                }
             }
             if (!finished) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -298,7 +344,7 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
             {"choices", {{
                 {"index", 0},
                 {"message", {{"role", "assistant"}, {"content", text}}},
-                {"finish_reason", "stop"}
+                {"finish_reason", final_reason}
             }}},
             {"usage", {
                 {"prompt_tokens", 0},

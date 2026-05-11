@@ -120,7 +120,7 @@ static void test_ffn_shapes() {
     // SwiGLU gate-parallel
     ggml_tensor * out = gc_build_ffn(ctx, cur,
         up, nullptr, gate, nullptr, down, nullptr,
-        GC_FFN_SILU, GC_FFN_PAR, null_cb, 0);
+        GC_FFN_SWIGLU, GC_FFN_PAR, null_cb, 0);
     CHECK(out->ne[0] == n_embd);
     CHECK(out->ne[1] == n_tokens);
 

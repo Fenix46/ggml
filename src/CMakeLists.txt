@@ -494,6 +494,7 @@ endif()
 
 # ── GGUF.CORE subsystems ──────────────────────────────────────────────────────
 add_subdirectory(loader)
+add_subdirectory(common)
 add_subdirectory(arch)
 add_subdirectory(vocab)
 add_subdirectory(chat)

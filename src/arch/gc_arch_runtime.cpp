@@ -147,13 +147,13 @@ bool gc_arch_runtime_build_ffn_params(
         case GC_ARCH_GEMMA3N:
         case GC_ARCH_GEMMA4:
         case GC_ARCH_GEMMA_EMBEDDING:
-            out.act       = GC_FFN_GELU;
+            out.act       = GC_FFN_GEGLU;
             out.has_gate  = true;
             out.gate_mode = GC_FFN_PAR;
             break;
         // SwiGLU (everything else: Llama, Qwen, Mistral, Falcon, etc.)
         default:
-            out.act       = GC_FFN_SILU;
+            out.act       = GC_FFN_SWIGLU;
             out.has_gate  = true;
             out.gate_mode = GC_FFN_PAR;
             break;
