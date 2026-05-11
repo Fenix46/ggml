@@ -73,6 +73,7 @@ int main() {
     CHECK(out.contains("created"));
     CHECK(out["choices"].is_array());
     CHECK(out.contains("usage"));
+    CHECK(out["usage"].contains("completion_tokens"));
 
     // Stream chat completion
     req["stream"] = true;
@@ -90,6 +91,19 @@ int main() {
     CHECK(parse_json_checked(badresp->body, berr));
     CHECK(berr.contains("error"));
     CHECK(berr["error"].contains("type"));
+
+    // Invalid stream type
+    json bad2 = {
+        {"model", "test-model"},
+        {"messages", {{{"role", "user"}, {"content", "hi"}}}},
+        {"stream", "yes"}
+    };
+    auto badresp2 = cli.Post("/v1/chat/completions", bad2.dump(), "application/json");
+    CHECK(badresp2 != nullptr);
+    CHECK(badresp2->status == 400);
+    json berr2;
+    CHECK(parse_json_checked(badresp2->body, berr2));
+    CHECK(berr2.contains("error"));
 
     server.stop();
     CHECK(!server.is_running());

@@ -34,6 +34,26 @@ static int64_t gc__unix_time_now() {
     return static_cast<int64_t>(std::time(nullptr));
 }
 
+static bool gc__validate_chat_request(const json & in, std::string & err) {
+    if (!in.contains("model") || !in["model"].is_string()) {
+        err = "missing or invalid 'model'";
+        return false;
+    }
+    if (!in.contains("messages") || !in["messages"].is_array()) {
+        err = "missing or invalid 'messages'";
+        return false;
+    }
+    if (in.contains("stream") && !in["stream"].is_boolean()) {
+        err = "invalid 'stream': expected boolean";
+        return false;
+    }
+    if (in.contains("max_tokens") && !in["max_tokens"].is_number_integer()) {
+        err = "invalid 'max_tokens': expected integer";
+        return false;
+    }
+    return true;
+}
+
 class gc_mock_runtime_t : public gc_server_runtime_t {
 public:
     std::string submit(const gc_server_request_t & req) override {
@@ -167,14 +187,11 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
             return;
         }
 
-        if (!in.contains("model") || !in["model"].is_string()) {
+        std::string err_msg;
+        if (!gc__validate_chat_request(in, err_msg)) {
             res.status = 400;
-            res.set_content(R"({"error":{"message":"missing or invalid 'model'","type":"invalid_request_error"}})", "application/json");
-            return;
-        }
-        if (!in.contains("messages") || !in["messages"].is_array()) {
-            res.status = 400;
-            res.set_content(R"({"error":{"message":"missing or invalid 'messages'","type":"invalid_request_error"}})", "application/json");
+            json e = {{"error", {{"message", err_msg}, {"type", "invalid_request_error"}}}};
+            res.set_content(e.dump(), "application/json");
             return;
         }
 
@@ -184,6 +201,8 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
         reqv.model = in["model"].get<std::string>();
         reqv.prompt_text = gc__extract_prompt(in);
         reqv.max_tokens = in.value("max_tokens", 16);
+        if (reqv.max_tokens <= 0) reqv.max_tokens = 1;
+        if (reqv.max_tokens > 4096) reqv.max_tokens = 4096;
         reqv.stream = stream;
 
         const std::string rid = impl_->runtime->submit(reqv);
@@ -246,13 +265,17 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
         }
 
         std::string text;
+        int completion_tokens = 0;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         bool finished = false;
         while (std::chrono::steady_clock::now() < deadline && !finished) {
             auto evs = impl_->runtime->step();
             for (const auto & ev : evs) {
                 if (ev.req_id != rid) continue;
-                if (ev.token >= 0) text += gc__token_to_text(ev.token);
+                if (ev.token >= 0) {
+                    text += gc__token_to_text(ev.token);
+                    completion_tokens++;
+                }
                 finished = ev.finished;
             }
             if (!finished) std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -270,8 +293,8 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
             }}},
             {"usage", {
                 {"prompt_tokens", 0},
-                {"completion_tokens", 0},
-                {"total_tokens", 0}
+                {"completion_tokens", completion_tokens},
+                {"total_tokens", completion_tokens}
             }}
         };
         res.status = 200;
