@@ -1,10 +1,12 @@
 #include "gc_arch.h"
+#include "gc_arch_llama.h"
 #include "gc_hparams.h"
 #include "gc_gguf_loader.h"
 #include "gc_common.h"
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -111,6 +113,45 @@ static void test_tensor_info() {
     CHECK(te.op    == GGML_OP_GET_ROWS,       "token_embd op is GET_ROWS");
 }
 
+// ── LLaMA architecture adapter ───────────────────────────────────────────────
+static void test_llama_arch_adapter() {
+    gc_hparams_t hp;
+    hp.arch = GC_ARCH_LLAMA;
+    hp.n_embd = 4096;
+    hp.n_layer = 2;
+    hp.n_head = 32;
+    hp.n_head_kv = 8;
+    hp.n_ctx_train = 8192;
+    hp.rope_freq_base = 500000.0f;
+    hp.rope_scale_linear = 8.0f;
+    hp.f_attn_logit_softcapping = 0.0f;
+    hp.f_max_alibi_bias = 0.0f;
+
+    std::string err;
+    CHECK(gc_arch_llama_validate_hparams(hp, &err), "llama hparams validation passes");
+
+    gc_attn_params_t ap;
+    CHECK(gc_arch_llama_build_attn_params(hp, 0, 128, ap, &err), "llama attn params build passes");
+    CHECK(ap.n_head_q == 32, "attn params q heads");
+    CHECK(ap.n_head_kv == 8, "attn params kv heads");
+    CHECK(ap.n_embd_head_q == 128, "attn params q head dim");
+    CHECK(ap.n_embd_head_v == 128, "attn params v head dim");
+    CHECK(ap.n_tokens == 128, "attn params token count");
+    CHECK(fabsf(ap.kq_scale - (1.0f / sqrtf(128.0f))) < 1e-6f, "attn params default kq scale");
+
+    gc_rope_params_t rp;
+    CHECK(gc_arch_llama_build_rope_params(hp, rp, &err), "llama rope params build passes");
+    CHECK(rp.n_dims == 128, "rope dims default to head dim");
+    CHECK(rp.mode == GGML_ROPE_TYPE_NEOX, "rope mode is NEOX");
+    CHECK(rp.n_ctx_orig == 8192, "rope n_ctx_orig");
+    CHECK(fabsf(rp.freq_base - 500000.0f) < 1e-6f, "rope freq_base");
+    CHECK(fabsf(rp.freq_scale - 0.125f) < 1e-6f, "rope linear freq scale");
+
+    hp.f_attn_scale = 0.5f;
+    CHECK(gc_arch_llama_build_attn_params(hp, 0, 64, ap, &err), "attn params build with explicit scale");
+    CHECK(fabsf(ap.kq_scale - 0.5f) < 1e-6f, "attn params explicit kq scale");
+}
+
 // ── Hparams from file (optional) ──────────────────────────────────────────────
 static void test_hparams_from_file(const char * path) {
     gc_loader_params_t params;
@@ -124,6 +165,17 @@ static void test_hparams_from_file(const char * path) {
     CHECK(hp.n_embd > 0,             "n_embd > 0");
     CHECK(hp.n_layer > 0,            "n_layer > 0");
     CHECK(hp.n_head > 0,             "n_head > 0");
+
+    if (hp.arch == GC_ARCH_LLAMA || hp.arch == GC_ARCH_LLAMA_EMBED) {
+        std::string err;
+        gc_attn_params_t ap;
+        gc_rope_params_t rp;
+        CHECK(gc_arch_llama_validate_hparams(hp, &err), "llama file hparams valid");
+        CHECK(gc_arch_llama_build_attn_params(hp, 0, 16, ap, &err), "llama file attn params build");
+        CHECK(gc_arch_llama_build_rope_params(hp, rp, &err), "llama file rope params build");
+        CHECK(ap.n_embd_head_q > 0, "llama file attn head dim > 0");
+        CHECK(rp.n_dims > 0, "llama file rope dims > 0");
+    }
 
     fprintf(stdout,
         "  arch=%s  n_vocab=%u  n_embd=%u  n_layer=%u  n_head=%u  n_head_kv=%u  n_ff=%u\n",
@@ -143,6 +195,7 @@ int main(int argc, char ** argv) {
     test_kv_resolve();
     test_tensor_names();
     test_tensor_info();
+    test_llama_arch_adapter();
 
     if (argc >= 2) {
         fprintf(stdout, "\n[hparams from file: %s]\n", argv[1]);
