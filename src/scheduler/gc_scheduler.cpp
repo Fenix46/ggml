@@ -131,22 +131,34 @@ gc_new_req_data_t gc_scheduler_t::make_new_req_data(const gc_request_t * req) co
 
 gc_cached_req_entry_t gc_scheduler_t::make_cached_entry(
         const gc_request_t * req,
-        const std::vector<int32_t> & new_block_ids) const {
+        const std::vector<int32_t> & /*new_block_ids_unused*/) const {
     gc_cached_req_entry_t e;
     e.req_id              = req->request_id;
-    e.new_block_ids       = new_block_ids;
     e.num_computed_tokens = req->num_computed_tokens;
     e.num_output_tokens   = req->num_output_tokens();
     e.num_prompt_tokens   = req->num_prompt_tokens();
 
-    // last_token: most recently generated token, or last prompt token if no output yet
+    // Always provide the COMPLETE logical block table from the KV manager.
+    // The runner maps logical positions to physical blocks via:
+    //   physical_block = block_ids[token_pos / block_size]
+    // Providing a partial table would cause writes/reads to wrong blocks.
+    const gc_req_blocks_t * rb = kv_mgr_.get_blocks(req->request_id);
+    if (rb) {
+        auto ids = rb->block_ids();
+        e.block_ids.assign(ids.begin(), ids.end());
+    }
+
+    // last_token: the most recently generated output token.
+    // On the first decode step (output_token_ids empty), use the last prompt
+    // token because that is what was forwarded last during prefill and what
+    // the scheduler needs to seed the decode loop.
     if (!req->output_token_ids.empty()) {
         e.last_token = req->output_token_ids.back();
     } else if (!req->prompt_token_ids.empty()) {
         e.last_token = req->prompt_token_ids.back();
     }
 
-    // all_token_ids: full sequence = prompt + output so far
+    // all_token_ids: prompt + output generated so far.
     e.all_token_ids.reserve(req->prompt_token_ids.size() + req->output_token_ids.size());
     e.all_token_ids.insert(e.all_token_ids.end(),
                            req->prompt_token_ids.begin(), req->prompt_token_ids.end());
@@ -169,8 +181,6 @@ gc_sched_output_t gc_scheduler_t::schedule() {
     // If allocation fails, preempt the lowest-priority running request.
 
     std::vector<gc_request_t *> scheduled_running;
-    // Track which running reqs were scheduled (req → new block ids)
-    std::unordered_map<std::string, std::vector<int32_t>> running_new_blocks;
 
     int idx = 0;
     while (idx < (int)running_.size() && token_budget > 0) {
@@ -179,7 +189,7 @@ gc_sched_output_t gc_scheduler_t::schedule() {
         int num_new = num_new_tokens_for(req, token_budget);
         if (num_new <= 0) { ++idx; continue; }
 
-        // Try to allocate.
+        // Try to extend KV slots for this running request.
         while (true) {
             const gc_req_blocks_t * rb = kv_mgr_.allocate_slots(
                 req->request_id,
@@ -191,7 +201,6 @@ gc_sched_output_t gc_scheduler_t::schedule() {
             if (rb != nullptr) break;
 
             // Allocation failed: preempt lowest-priority running request.
-            // For FCFS: preempt last (youngest). For PRIORITY: preempt worst.
             if (running_.empty()) break;
 
             gc_request_t * victim;
@@ -203,23 +212,19 @@ gc_sched_output_t gc_scheduler_t::schedule() {
                 victim = running_.back();
             }
 
-            // If the only candidate is the request itself, give up.
             if (victim == req) { goto cannot_schedule_running; }
 
             // Un-schedule victim if it was already scheduled this step.
-            auto vi = running_new_blocks.find(victim->request_id);
-            if (vi != running_new_blocks.end()) {
+            {
                 auto ns_it = out.num_scheduled_tokens.find(victim->request_id);
                 if (ns_it != out.num_scheduled_tokens.end()) {
                     token_budget += ns_it->second;
                     out.total_scheduled_tokens -= ns_it->second;
                     out.num_scheduled_tokens.erase(ns_it);
                 }
-                running_new_blocks.erase(vi);
                 scheduled_running.erase(
                     std::remove(scheduled_running.begin(), scheduled_running.end(), victim),
                     scheduled_running.end());
-                if (victim == req) { idx--; }
             }
 
             running_.erase(std::remove(running_.begin(), running_.end(), victim), running_.end());
@@ -228,23 +233,10 @@ gc_sched_output_t gc_scheduler_t::schedule() {
             if (victim == req) goto cannot_schedule_running;
         }
 
-        {
-            // Collect newly allocated block ids.
-            const gc_req_blocks_t * rb2 = kv_mgr_.get_blocks(req->request_id);
-            std::vector<int32_t> new_blk_ids;
-            if (rb2) {
-                // New blocks = those beyond what was allocated before.
-                // Simplification: send all block ids (engine deduplicates).
-                auto all_ids = rb2->block_ids();
-                new_blk_ids.assign(all_ids.begin(), all_ids.end());
-            }
-
-            scheduled_running.push_back(req);
-            running_new_blocks[req->request_id] = new_blk_ids;
-            out.num_scheduled_tokens[req->request_id] = num_new;
-            out.total_scheduled_tokens += num_new;
-            token_budget -= num_new;
-        }
+        scheduled_running.push_back(req);
+        out.num_scheduled_tokens[req->request_id] = num_new;
+        out.total_scheduled_tokens += num_new;
+        token_budget -= num_new;
         ++idx;
         continue;
 
@@ -287,15 +279,12 @@ gc_sched_output_t gc_scheduler_t::schedule() {
         req->num_computed_tokens = num_computed;
         running_.push_back(req);
 
-        auto all_ids = rb->block_ids();
-        std::vector<int32_t> blk_ids(all_ids.begin(), all_ids.end());
-
         bool is_new = (req->num_preemptions == 0 && req->num_output_tokens() == 0);
         if (is_new) {
             out.new_reqs.push_back(make_new_req_data(req));
         } else {
-            // resumed after preemption
-            out.cached_reqs.push_back(make_cached_entry(req, blk_ids));
+            // resumed after preemption — make_cached_entry reads full block table
+            out.cached_reqs.push_back(make_cached_entry(req, {}));
         }
 
         out.num_scheduled_tokens[req->request_id] = num_new;
@@ -305,9 +294,9 @@ gc_sched_output_t gc_scheduler_t::schedule() {
 
 build_output:
     // Fill cached_reqs for running requests scheduled in step 1.
+    // make_cached_entry reads the full block table from kv_mgr_ directly.
     for (gc_request_t * req : scheduled_running) {
-        auto & new_blks = running_new_blocks[req->request_id];
-        out.cached_reqs.push_back(make_cached_entry(req, new_blks));
+        out.cached_reqs.push_back(make_cached_entry(req, {}));
     }
 
     // Advance num_computed_tokens post-schedule (mirrors vllm _update_after_schedule).

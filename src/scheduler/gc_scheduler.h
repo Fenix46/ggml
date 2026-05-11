@@ -33,13 +33,17 @@ struct gc_new_req_data_t {
 
 struct gc_cached_req_entry_t {
     std::string          req_id;
-    std::vector<int32_t> new_block_ids;     // blocks newly allocated this step
+    // COMPLETE logical block table for this request.
+    // block_ids[i] = physical block id covering logical tokens
+    //   [i*block_size, (i+1)*block_size).
+    // Always the full table — never a partial/delta list.
+    // The runner uses this verbatim to index the KV buffer.
+    std::vector<int32_t> block_ids;
     int                  num_computed_tokens = 0;
     int                  num_output_tokens   = 0;
     int                  num_prompt_tokens   = 0;
     int32_t              last_token          = -1; // last generated token (decode step input)
-    // Full token sequence needed by runner to reconstruct context:
-    //   prompt_token_ids + output_token_ids up to this step.
+    // Full token sequence: prompt_token_ids + output_token_ids so far.
     std::vector<int32_t> all_token_ids;
 };
 

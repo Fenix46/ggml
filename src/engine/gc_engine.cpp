@@ -33,21 +33,24 @@ gc_batch_t gc_engine_t::build_batch(const gc_sched_output_t & sched_out) const {
         if (n <= 0) continue;
 
         gc_batch_entry_t e;
-        e.req_id        = nr.req_id;
-        e.block_ids     = nr.block_ids;
-        e.num_computed  = nr.num_computed_tokens;
-        e.num_new_tokens = n;
-        e.is_prefill    = true;
+        e.req_id             = nr.req_id;
+        e.block_ids          = nr.block_ids;  // full block table from allocate_slots
+        e.num_computed       = nr.num_computed_tokens;
+        e.num_new_tokens     = n;
+        e.num_prompt_tokens  = (int)nr.prompt_token_ids.size();
+        e.is_prefill         = true;
 
-        // token_ids = tokens[num_computed : num_computed + n]
+        // token_ids = prompt[num_computed : num_computed + n]
         int start = nr.num_computed_tokens;
-        int end   = start + n;
-        end = std::min(end, (int)nr.prompt_token_ids.size());
+        int end   = std::min(start + n, (int)nr.prompt_token_ids.size());
         e.token_ids.assign(
             nr.prompt_token_ids.begin() + start,
             nr.prompt_token_ids.begin() + end);
 
-        // Position ids: absolute positions for each token in this chunk
+        // Final prefill chunk when this step covers the last prompt token.
+        e.is_last_prefill = ((e.num_computed + (int)e.token_ids.size()) >= e.num_prompt_tokens);
+
+        // Absolute position ids for RoPE
         e.position_ids.resize(e.token_ids.size());
         for (int i = 0; i < (int)e.token_ids.size(); ++i) {
             e.position_ids[i] = nr.num_computed_tokens + i;
@@ -64,11 +67,12 @@ gc_batch_t gc_engine_t::build_batch(const gc_sched_output_t & sched_out) const {
         if (n <= 0) continue;
 
         gc_batch_entry_t e;
-        e.req_id         = cr.req_id;
-        e.block_ids      = cr.new_block_ids;
-        e.num_computed   = cr.num_computed_tokens;
-        e.num_new_tokens = n;
-        e.is_prefill     = (cr.num_computed_tokens < cr.num_prompt_tokens);
+        e.req_id            = cr.req_id;
+        e.block_ids         = cr.block_ids;  // COMPLETE logical block table
+        e.num_computed      = cr.num_computed_tokens;
+        e.num_new_tokens    = n;
+        e.num_prompt_tokens = cr.num_prompt_tokens;
+        e.is_prefill        = (cr.num_computed_tokens < cr.num_prompt_tokens);
 
         if (e.is_prefill) {
             // Prefill continuation: next chunk of prompt tokens
@@ -76,12 +80,15 @@ gc_batch_t gc_engine_t::build_batch(const gc_sched_output_t & sched_out) const {
             int end   = std::min(start + n, (int)cr.all_token_ids.size());
             e.token_ids.assign(cr.all_token_ids.begin() + start,
                                cr.all_token_ids.begin() + end);
+            // Final prefill when this chunk reaches the end of the prompt
+            e.is_last_prefill = ((e.num_computed + (int)e.token_ids.size()) >= e.num_prompt_tokens);
         } else {
-            // Decode step: single token (last generated)
-            e.token_ids = { cr.last_token };
+            // Decode step: forward the last generated token
+            e.token_ids      = { cr.last_token };
+            e.is_last_prefill = false;
         }
 
-        // Position ids: absolute positions for each token in this chunk
+        // Absolute position ids for RoPE
         e.position_ids.resize(e.token_ids.size());
         for (int i = 0; i < (int)e.token_ids.size(); ++i) {
             e.position_ids[i] = cr.num_computed_tokens + i;
@@ -118,37 +125,35 @@ gc_step_output_t gc_engine_t::process_output(
 
     // Requests that produced a real token this step.
     for (auto & [req_id, tok] : new_tokens) {
-        if (tok < 0) continue;  // prefill-only, no token sampled
+        if (tok < 0) continue;  // prefill-only steps return -1
 
         gc_req_output_t ro;
         ro.req_id = req_id;
         ro.token  = tok;
 
-        // Check if finished (scheduler moved it to finished set).
-        if (sched_out.finished_req_ids.count(req_id) ||
-            // also check what update_from_output decided
-            (!sched_.has_work() && sched_.num_running() == 0 && sched_.num_waiting() == 0)) {
-            // Conservative check: if not in running or waiting it's done.
-        }
-        // Simpler: runner marks finished via sched_.update_from_output().
-        // Finished requests are absent from running_ after the update.
-        // We report finished = true if req no longer in running.
-        ro.finished = (sched_.kv_mgr_proxy(req_id) == nullptr);
+        // A request is finished if update_from_output() moved it out of the
+        // running set (kv_mgr_ entry freed) OR it appears in finished_req_ids.
+        // kv_mgr_proxy returns nullptr both for unknown requests AND for
+        // finished ones — both mean "not running", which is what we want here.
+        const bool in_finished_set = (sched_out.finished_req_ids.count(req_id) > 0);
+        const bool no_longer_running = (sched_.kv_mgr_proxy(req_id) == nullptr);
+        ro.finished = in_finished_set || no_longer_running;
         if (ro.finished) {
-            ro.finish_reason = GC_REQ_FINISHED_STOPPED;  // placeholder; scheduler knows real reason
+            ro.finish_reason = GC_REQ_FINISHED_STOPPED;
         }
         out.outputs.push_back(ro);
     }
 
-    // Also report requests that finished this step (from scheduler finished set).
+    // Also report requests that finished this step without generating a token
+    // (aborted, or finished by the scheduler for other reasons).
     for (const auto & fid : sched_out.finished_req_ids) {
         bool already = false;
         for (auto & o : out.outputs) { if (o.req_id == fid) { already = true; break; } }
         if (!already) {
             gc_req_output_t ro;
-            ro.req_id     = fid;
-            ro.token      = -1;
-            ro.finished   = true;
+            ro.req_id        = fid;
+            ro.token         = -1;
+            ro.finished      = true;
             ro.finish_reason = GC_REQ_FINISHED_STOPPED;
             out.outputs.push_back(ro);
         }

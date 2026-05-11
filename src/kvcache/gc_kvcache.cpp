@@ -112,15 +112,14 @@ std::vector<gc_kv_block_t *> gc_block_pool_t::get_new_blocks(int n) {
     if (n <= 0) return {};
     if (free_queue_.size() < n) return {};
 
-    // Try to satisfy from unhashedfree blocks first (LRU order).
-    // If a block in the free queue has a hash it's a cached block being evicted.
     auto blks = free_queue_.popleft_n(n);
     for (gc_kv_block_t * b : blks) {
-        // If this block was in the prefix cache, evict it.
+        // Evict from prefix cache if this block had a hash.
         if (b->block_hash.has_value()) {
             hash_to_block_.erase(b->block_hash.value());
             b->block_hash.reset();
         }
+        assert(b->ref_cnt == 0);
         b->ref_cnt = 1;
     }
     return blks;
@@ -129,7 +128,7 @@ std::vector<gc_kv_block_t *> gc_block_pool_t::get_new_blocks(int n) {
 void gc_block_pool_t::touch(const std::vector<gc_kv_block_t *> & blks) {
     for (gc_kv_block_t * b : blks) {
         if (b->is_null) continue;
-        // If it's in the free queue (ref_cnt==0), pull it out.
+        // ref_cnt==0 means block is in the free queue — remove it.
         if (b->ref_cnt == 0 && b->prev_free != nullptr) {
             free_queue_.remove(b);
         }
@@ -151,7 +150,7 @@ void gc_block_pool_t::free_blocks(const std::vector<gc_kv_block_t *> & blks) {
 void gc_block_pool_t::cache_block(gc_block_hash_t hash, gc_kv_block_t * blk) {
     if (blk->is_null) return;
 
-    // If already cached under same hash, nothing to do.
+    // Already cached under same hash, nothing to do.
     if (blk->block_hash.has_value() && blk->block_hash.value() == hash) return;
 
     // Remove stale entry for this block if it had a different hash.
@@ -159,8 +158,9 @@ void gc_block_pool_t::cache_block(gc_block_hash_t hash, gc_kv_block_t * blk) {
         hash_to_block_.erase(blk->block_hash.value());
     }
 
-    // If another block already holds this hash, keep the existing one
-    // (that block may be in active use; don't steal its hash slot).
+    // If another block already holds this hash, keep the existing one.
+    // Block tables are append-only: we never steal a hash slot from an
+    // active block (matches vllm NOTE #1 in BlockHashToBlockMap).
     auto it = hash_to_block_.find(hash);
     if (it != hash_to_block_.end()) return;
 
@@ -186,10 +186,10 @@ void gc_block_pool_t::evict_blocks(const std::vector<int> & block_ids) {
 }
 
 bool gc_block_pool_t::reset_prefix_cache() {
-    // Can only reset when no block is actively referenced (ref_cnt > 1 means
-    // it's held by a request, not just sitting in the free queue with hash).
+    // Can only reset when no block is actively held (ref_cnt > 1 means
+    // held by a request beyond the pinned null block).
     for (auto & b : blocks_) {
-        if (!b.is_null && b.ref_cnt > 1) return false;
+        if (!b.is_null && b.ref_cnt > 0) return false;
     }
     hash_to_block_.clear();
     for (auto & b : blocks_) {
@@ -219,6 +219,31 @@ std::vector<int32_t> gc_req_blocks_t::block_ids() const {
 }
 
 // ── KV manager ───────────────────────────────────────────────────────────────
+//
+// LIFECYCLE INVARIANTS (mirrors vllm SingleTypeKVCacheManager):
+//
+//   1. req_blocks_[id].blocks is the COMPLETE logical block table for the
+//      request, indexed 0..N-1 where N = ceil(num_tokens / block_size).
+//      Logical block i covers tokens [i*block_size, (i+1)*block_size).
+//
+//   2. Block table is APPEND-ONLY after first allocation.
+//      allocate_slots() for a running request only appends new blocks;
+//      it never clears or rebuilds the existing table.
+//
+//   3. Prefix-cached blocks returned by find_cache_hit() are prepended
+//      once on first admission via allocate_new_request(). After that,
+//      the request is "running" and only gets extensions.
+//
+//   4. ref_cnt > 0  <=>  block is held by at least one request or
+//      pinned (null block always ref_cnt=1).
+//      ref_cnt == 0 <=>  block is in the free queue (eviction candidate).
+//
+//   5. free() decrements ref_counts in reverse order (LRU-friendly)
+//      then removes the entry from req_blocks_.
+//
+//   6. No dangling pointer: req_blocks_[id].blocks contains only pointers
+//      into pool_.blocks_ which is a stable std::vector (never resized
+//      after construction).
 
 gc_kv_manager_t::gc_kv_manager_t(const gc_kv_manager_params_t & p)
     : params_(p), pool_(p.num_blocks) {}
@@ -242,41 +267,104 @@ gc_kv_manager_t::cache_hit_t gc_kv_manager_t::find_cache_hit(
     return hit;
 }
 
+// ── allocate_slots ────────────────────────────────────────────────────────────
+// Called on every scheduling step for every scheduled request.
+//
+// For NEW requests (not yet in req_blocks_):
+//   - Prepend cached_blocks (prefix hits) — touch them to pin
+//   - Append fresh blocks to reach num_tokens capacity
+//
+// For RUNNING requests (already in req_blocks_):
+//   - Block table is extended (append-only)
+//   - cached_blocks MUST be empty (running requests have no new prefix hits)
+//   - Only fresh blocks are allocated to cover new token slots
+//
+// Returns nullptr if not enough free blocks are available.
+
 const gc_req_blocks_t * gc_kv_manager_t::allocate_slots(
         const std::string                  & request_id,
         int                                  num_tokens,
         const std::vector<gc_kv_block_t *> & cached_blocks,
         const std::vector<gc_block_hash_t> & block_hashes,
         int                                  num_computed) {
-    int total_needed    = blocks_needed(num_tokens);
+    int total_needed = blocks_needed(num_tokens);
+
+    auto it = req_blocks_.find(request_id);
+    bool is_running = (it != req_blocks_.end());
+
+    if (is_running) {
+        // Running request: block table already exists, only extend it.
+        assert(cached_blocks.empty() &&
+               "prefix cache hits impossible for already-running request");
+
+        gc_req_blocks_t & rb = it->second;
+        int already_have = (int)rb.blocks.size();
+        int new_needed   = total_needed - already_have;
+        if (new_needed <= 0) return &rb; // enough slots already
+
+        if (new_needed > pool_.num_free_blocks()) return nullptr;
+
+        auto new_blks = pool_.get_new_blocks(new_needed);
+        if ((int)new_blks.size() < new_needed) {
+            // Should not happen given the check above.
+            pool_.free_blocks(new_blks);
+            return nullptr;
+        }
+        rb.blocks.insert(rb.blocks.end(), new_blks.begin(), new_blks.end());
+
+        if (params_.enable_prefix) {
+            cache_blocks(request_id, block_hashes, num_computed);
+        }
+        return &rb;
+    }
+
+    // New request: build block table from scratch.
     int already_have    = (int)cached_blocks.size();
     int new_blocks_need = total_needed - already_have;
     if (new_blocks_need < 0) new_blocks_need = 0;
 
-    if (new_blocks_need > pool_.num_free_blocks()) return nullptr;
+    // Count evictable cached blocks — they may need to come off the free queue.
+    int evictable = 0;
+    for (auto * b : cached_blocks) {
+        if (!b->is_null && b->ref_cnt == 0) evictable++;
+    }
+    int free_needed = new_blocks_need + evictable;
+    if (free_needed > pool_.num_free_blocks()) return nullptr;
 
-    // Touch (pin) the cached hit blocks.
+    // Touch (pin) the cached hit blocks so they won't be evicted.
     pool_.touch(cached_blocks);
 
-    // Allocate fresh blocks.
+    // Allocate fresh blocks for the remainder.
     auto new_blks = pool_.get_new_blocks(new_blocks_need);
     if ((int)new_blks.size() < new_blocks_need) {
-        // Shouldn't happen since we checked above, but be safe.
         pool_.free_blocks(new_blks);
+        // Undo touch — decrement ref_counts we just incremented.
         pool_.free_blocks(cached_blocks);
         return nullptr;
     }
 
     gc_req_blocks_t & rb = req_blocks_[request_id];
-    rb.blocks.clear();
+    // Block table must be empty for a new request.
+    assert(rb.blocks.empty() && "block table must be empty for new request");
     rb.blocks.insert(rb.blocks.end(), cached_blocks.begin(), cached_blocks.end());
     rb.blocks.insert(rb.blocks.end(), new_blks.begin(),     new_blks.end());
 
-    // Cache any fully computed blocks.
+    // Validate: no duplicate writable block ownership.
+    // Each block must appear at most once in this table.
+    // (prefix-cached blocks can be shared across requests but not duplicated
+    //  within a single request's table.)
+    assert([&]() {
+        std::unordered_set<int32_t> seen;
+        for (auto * b : rb.blocks) {
+            if (b->is_null) continue;
+            if (!seen.insert(b->block_id).second) return false;
+        }
+        return true;
+    }() && "duplicate block_id in request block table");
+
     if (params_.enable_prefix) {
         cache_blocks(request_id, block_hashes, num_computed);
     }
-
     return &rb;
 }
 
@@ -301,7 +389,7 @@ void gc_kv_manager_t::free(const std::string & request_id) {
     auto it = req_blocks_.find(request_id);
     if (it == req_blocks_.end()) return;
 
-    // Free in reverse order so tail blocks are evicted first (LRU tail = MRU).
+    // Free in reverse order so tail blocks are evicted first (LRU-friendly).
     auto & blks = it->second.blocks;
     std::vector<gc_kv_block_t *> rev(blks.rbegin(), blks.rend());
     pool_.free_blocks(rev);

@@ -19,10 +19,17 @@ struct gc_batch_entry_t {
     std::string          req_id;
     std::vector<int32_t> token_ids;         // tokens to process this step
     std::vector<int32_t> position_ids;      // absolute position for each token (for RoPE)
-    std::vector<int32_t> block_ids;         // KV block ids for this request
+    // COMPLETE logical block table: block_ids[i] covers tokens
+    //   [i*block_size, (i+1)*block_size).  Always the full table.
+    std::vector<int32_t> block_ids;
     int                  num_computed       = 0;  // tokens already in KV cache
     int                  num_new_tokens     = 0;  // tokens in token_ids this step
-    bool                 is_prefill         = false;  // true if still in prefill phase
+    int                  num_prompt_tokens  = 0;  // total prompt length (for final-prefill detection)
+    bool                 is_prefill         = false;  // true if still processing prompt tokens
+    // True when this prefill step covers the last chunk of the prompt.
+    // The runner MUST sample a token when is_last_prefill=true (it produces
+    // the first output token, which seeds the decode loop).
+    bool                 is_last_prefill    = false;
 };
 
 struct gc_batch_t {

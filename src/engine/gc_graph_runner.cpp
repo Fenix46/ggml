@@ -180,71 +180,82 @@ const gc_tensor_weight_t * gc_graph_runner_t::find_w(gc_tensor_role_t role,
     return loader_->find_weight(name.c_str());
 }
 
+// ── gc__ctx_make: convenience wrapper ────────────────────────────────────────
+
+static ggml_context * gc__ctx_make(size_t extra_tensors) {
+    // Per-layer budget: weights (no_alloc views) + intermediate activations.
+    // 64MB covers even large hidden dims; views are zero-copy.
+    const size_t mem = 64ULL * 1024 * 1024
+                     + ggml_tensor_overhead() * (extra_tensors + 64)
+                     + ggml_graph_overhead();
+    ggml_init_params ip{mem, nullptr, false};
+    return ggml_init(ip);
+}
+
 // ── forward() ─────────────────────────────────────────────────────────────────
+// One ggml_context per layer — freed at end of each layer so memory stays
+// bounded regardless of model depth or hidden size.
+// The residual stream is kept in a std::vector<float> between layers.
 
 bool gc_graph_runner_t::forward(const std::vector<int32_t> & token_ids,
                                  const std::vector<int32_t> & position_ids,
                                  const std::vector<int32_t> & block_ids,
                                  int                          num_computed,
-                                 bool                         is_prefill,
+                                 bool                         /*is_prefill*/,
                                  std::vector<float>         & logits_out) {
     if (token_ids.empty()) return false;
-    const int n_new = (int)token_ids.size();
+    const int     n_new   = (int)token_ids.size();
+    const int     n_ctx   = num_computed + n_new;
+    const int64_t n_embd  = (int64_t)hp_.n_embd;
+    const gc_graph_cb_t cb = [](ggml_tensor *, const char *, int) {};
 
-    // Context size: existing cached tokens + new tokens
-    const int n_ctx = num_computed + n_new;
-
-    // Slots for the new tokens being computed
     const auto new_slots = gc__make_slots(block_ids, (uint32_t)cfg_.kv_block_size,
                                            num_computed, n_new);
-    // Slots for the full cached context (for KV read)
     const auto all_slots = gc__make_slots(block_ids, (uint32_t)cfg_.kv_block_size,
                                            0, n_ctx);
 
-    // GGML context — size covers all tensors for one forward pass
-    const size_t mem = 512ULL * 1024 * 1024
-                     + ggml_tensor_overhead() * (size_t)(hp_.n_layer * 32 + 64)
-                     + ggml_graph_overhead();
-    ggml_init_params ip{mem, nullptr, false};
-    ggml_context * ctx = ggml_init(ip);
-    if (!ctx) return false;
-
-    auto nofail = [&](bool ok, const char * msg) -> bool {
-        if (!ok) { err_ = msg; ggml_free(ctx); return false; }
-        return true;
-    };
-
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    const gc_graph_cb_t cb = [](ggml_tensor *, const char *, int) {};
-
-    // ── Token embedding ───────────────────────────────────────────────────────
-    ggml_tensor * w_embd = gc__weight_view(ctx, loader_, w_tok_embd_);
-    if (!nofail(w_embd != nullptr, "token_embd view failed")) return false;
-
-    ggml_tensor * tok_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_new);
-    std::memcpy(tok_t->data, token_ids.data(), sizeof(int32_t) * (size_t)n_new);
-
-    ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_new);
-    std::memcpy(pos_t->data, position_ids.data(), sizeof(int32_t) * (size_t)n_new);
-
-    // cur: [n_embd, n_new]
-    ggml_tensor * cur = ggml_get_rows(ctx, w_embd, tok_t);
-
-    // Causal mask [n_ctx, n_new]: -inf for future tokens, 0 for past
-    ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
-                                                (int64_t)n_ctx, (int64_t)n_new);
+    // ── Step 1: token embedding → residual[n_embd * n_new] ───────────────────
+    std::vector<float> residual((size_t)n_embd * (size_t)n_new);
     {
-        float * m = static_cast<float *>(kq_mask->data);
-        for (int q = 0; q < n_new; ++q) {
-            const int q_pos = num_computed + q;
-            for (int k = 0; k < n_ctx; ++k) {
-                m[(size_t)q * n_ctx + k] = (k <= q_pos) ? 0.0f
-                    : -std::numeric_limits<float>::infinity();
-            }
+        ggml_context * ctx = gc__ctx_make(4);
+        if (!ctx) { err_ = "ctx alloc failed (embd)"; return false; }
+
+        ggml_tensor * w_embd = gc__weight_view(ctx, loader_, w_tok_embd_);
+        if (!w_embd) { ggml_free(ctx); err_ = "token_embd view failed"; return false; }
+
+        ggml_tensor * tok_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_new);
+        std::memcpy(tok_t->data, token_ids.data(), sizeof(int32_t) * (size_t)n_new);
+
+        ggml_tensor * embd_out = ggml_get_rows(ctx, w_embd, tok_t);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, embd_out);
+        if (ggml_graph_compute_with_ctx(ctx, gf, 1) != GGML_STATUS_SUCCESS) {
+            ggml_free(ctx); err_ = "embedding compute failed"; return false;
+        }
+        // embd_out may be quantized — dequant via ggml_cast if needed
+        if (embd_out->type != GGML_TYPE_F32) {
+            ggml_tensor * f32 = ggml_cast(ctx, embd_out, GGML_TYPE_F32);
+            ggml_cgraph * gf2 = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf2, f32);
+            ggml_graph_compute_with_ctx(ctx, gf2, 1);
+            std::memcpy(residual.data(), f32->data, sizeof(float) * residual.size());
+        } else {
+            std::memcpy(residual.data(), embd_out->data, sizeof(float) * residual.size());
+        }
+        ggml_free(ctx);
+    }
+
+    // Build causal mask (persistent across layers — just floats)
+    std::vector<float> kq_mask_data((size_t)n_ctx * (size_t)n_new);
+    for (int q = 0; q < n_new; ++q) {
+        const int q_pos = num_computed + q;
+        for (int k = 0; k < n_ctx; ++k) {
+            kq_mask_data[(size_t)q * (size_t)n_ctx + k] =
+                (k <= q_pos) ? 0.0f : -std::numeric_limits<float>::infinity();
         }
     }
 
-    // ── Transformer layers ────────────────────────────────────────────────────
+    // ── Step 2: transformer layers ────────────────────────────────────────────
     for (uint32_t il = 0; il < hp_.n_layer; ++il) {
 
         std::string err;
@@ -252,176 +263,221 @@ bool gc_graph_runner_t::forward(const std::vector<int32_t> & token_ids,
         gc_layer_flags_t lf{};
         if (!gc_arch_runtime_build_attn_params(hp_, il, (uint32_t)n_new, ap, &err) ||
             !gc_arch_runtime_build_layer_flags(hp_, il, lf, &err)) {
-            nofail(false, err.c_str()); return false;
+            err_ = err; return false;
         }
-
-        // ── Pre-attention norm ────────────────────────────────────────────────
-        ggml_tensor * w_attn_norm = gc__weight_view(ctx, loader_,
-            find_w(GC_TENSOR_ATTN_NORM, "weight", (int)il));
-        if (!nofail(w_attn_norm != nullptr, "attn_norm weight missing")) return false;
-
-        ggml_tensor * inp_sa = cur;
-        cur = gc_build_norm(ctx, cur, w_attn_norm, nullptr,
-                            norm_params_.type, norm_params_.eps, cb, (int)il);
-
-        // ── Q/K/V projections ─────────────────────────────────────────────────
-        ggml_tensor * w_q = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_Q, "weight", (int)il));
-        ggml_tensor * w_k = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_K, "weight", (int)il));
-        ggml_tensor * w_v = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_V, "weight", (int)il));
-        ggml_tensor * w_o = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_OUT, "weight", (int)il));
-        if (!nofail(w_q && w_k && w_v && w_o, "attn weight missing")) return false;
 
         const int64_t n_embd_hq = ap.n_embd_head_q;
         const int64_t n_embd_hv = ap.n_embd_head_v;
         const int64_t nq        = ap.n_head_q;
         const int64_t nkv       = ap.n_head_kv;
 
-        ggml_tensor * Qcur = ggml_mul_mat(ctx, w_q, cur);
-        Qcur = ggml_reshape_3d(ctx, Qcur, n_embd_hq, nq, (int64_t)n_new);
+        // ── 2a: Q/K/V projection + RoPE ──────────────────────────────────────
+        std::vector<float> Q_data((size_t)n_embd_hq * (size_t)nq  * (size_t)n_new);
+        std::vector<float> K_data((size_t)n_embd_hq * (size_t)nkv * (size_t)n_new);
+        std::vector<float> V_data((size_t)n_embd_hv * (size_t)nkv * (size_t)n_new);
+        {
+            ggml_context * ctx = gc__ctx_make(16);
+            if (!ctx) { err_ = "ctx alloc failed (qkv)"; return false; }
 
-        ggml_tensor * Kcur = ggml_mul_mat(ctx, w_k, cur);
-        Kcur = ggml_reshape_3d(ctx, Kcur, n_embd_hq, nkv, (int64_t)n_new);
+            ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, (int64_t)n_new);
+            std::memcpy(inp->data, residual.data(), sizeof(float) * residual.size());
 
-        ggml_tensor * Vcur = ggml_mul_mat(ctx, w_v, cur);
-        Vcur = ggml_reshape_3d(ctx, Vcur, n_embd_hv, nkv, (int64_t)n_new);
-
-        // Optional per-head Q/K norms (Gemma3+)
-        if (lf.has_attn_q_norm) {
-            ggml_tensor * w_qn = gc__weight_view(ctx, loader_,
-                find_w(GC_TENSOR_ATTN_Q_NORM, "weight", (int)il));
-            if (w_qn) {
-                ggml_tensor * q2d = ggml_reshape_2d(ctx, Qcur, n_embd_hq, nq * (int64_t)n_new);
-                q2d = gc_build_norm(ctx, q2d, w_qn, nullptr,
-                                    norm_params_.type, norm_params_.eps, cb, (int)il);
-                Qcur = ggml_reshape_3d(ctx, q2d, n_embd_hq, nq, (int64_t)n_new);
+            ggml_tensor * w_an = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_NORM, "weight", (int)il));
+            ggml_tensor * w_q  = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_Q,    "weight", (int)il));
+            ggml_tensor * w_k  = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_K,    "weight", (int)il));
+            ggml_tensor * w_v  = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_V,    "weight", (int)il));
+            if (!w_an || !w_q || !w_k || !w_v) {
+                ggml_free(ctx); err_ = "attn weight missing"; return false;
             }
-        }
-        if (lf.has_attn_k_norm) {
-            ggml_tensor * w_kn = gc__weight_view(ctx, loader_,
-                find_w(GC_TENSOR_ATTN_K_NORM, "weight", (int)il));
-            if (w_kn) {
-                ggml_tensor * k2d = ggml_reshape_2d(ctx, Kcur, n_embd_hq, nkv * (int64_t)n_new);
-                k2d = gc_build_norm(ctx, k2d, w_kn, nullptr,
-                                    norm_params_.type, norm_params_.eps, cb, (int)il);
-                Kcur = ggml_reshape_3d(ctx, k2d, n_embd_hq, nkv, (int64_t)n_new);
+
+            ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_new);
+            std::memcpy(pos_t->data, position_ids.data(), sizeof(int32_t) * (size_t)n_new);
+
+            ggml_tensor * normed = gc_build_norm(ctx, inp, w_an, nullptr,
+                                                  norm_params_.type, norm_params_.eps, cb, (int)il);
+            ggml_tensor * Qcur = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_q, normed),
+                                                   n_embd_hq, nq, (int64_t)n_new);
+            ggml_tensor * Kcur = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_k, normed),
+                                                   n_embd_hq, nkv, (int64_t)n_new);
+            ggml_tensor * Vcur = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_v, normed),
+                                                   n_embd_hv, nkv, (int64_t)n_new);
+
+            if (lf.has_attn_q_norm) {
+                ggml_tensor * w_qn = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_Q_NORM, "weight", (int)il));
+                if (w_qn) {
+                    Qcur = ggml_reshape_3d(ctx,
+                        gc_build_norm(ctx, ggml_reshape_2d(ctx, Qcur, n_embd_hq, nq*(int64_t)n_new),
+                                      w_qn, nullptr, norm_params_.type, norm_params_.eps, cb, (int)il),
+                        n_embd_hq, nq, (int64_t)n_new);
+                }
             }
+            if (lf.has_attn_k_norm) {
+                ggml_tensor * w_kn = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_K_NORM, "weight", (int)il));
+                if (w_kn) {
+                    Kcur = ggml_reshape_3d(ctx,
+                        gc_build_norm(ctx, ggml_reshape_2d(ctx, Kcur, n_embd_hq, nkv*(int64_t)n_new),
+                                      w_kn, nullptr, norm_params_.type, norm_params_.eps, cb, (int)il),
+                        n_embd_hq, nkv, (int64_t)n_new);
+                }
+            }
+
+            if (lf.apply_rope && rope_params_.n_dims > 0) {
+                Qcur = gc_rope_apply(ctx, Qcur, pos_t, nullptr, rope_params_);
+                Kcur = gc_rope_apply(ctx, Kcur, pos_t, nullptr, rope_params_);
+            }
+
+            // Materialise Q/K/V
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
+            if (ggml_graph_compute_with_ctx(ctx, gf, 1) != GGML_STATUS_SUCCESS) {
+                ggml_free(ctx); err_ = "qkv compute failed"; return false;
+            }
+
+            std::memcpy(Q_data.data(), Qcur->data, sizeof(float) * Q_data.size());
+            std::memcpy(K_data.data(), Kcur->data, sizeof(float) * K_data.size());
+            std::memcpy(V_data.data(), Vcur->data, sizeof(float) * V_data.size());
+            ggml_free(ctx);
         }
 
-        // RoPE
-        if (lf.apply_rope && rope_params_.n_dims > 0) {
-            Qcur = gc_rope_apply(ctx, Qcur, pos_t, nullptr, rope_params_);
-            Kcur = gc_rope_apply(ctx, Kcur, pos_t, nullptr, rope_params_);
+        // Write new K/V into paged buffer
+        gc__kv_write(kv_buf_, il, 0, new_slots, K_data.data(), (uint32_t)n_new);
+        gc__kv_write(kv_buf_, il, 1, new_slots, V_data.data(), (uint32_t)n_new);
+
+        // ── 2b: Attention + output proj ───────────────────────────────────────
+        std::vector<float> attn_result((size_t)n_embd * (size_t)n_new);
+        {
+            ggml_context * ctx = gc__ctx_make(16);
+            if (!ctx) { err_ = "ctx alloc failed (attn)"; return false; }
+
+            ggml_tensor * Qcur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                n_embd_hq, nq, (int64_t)n_new);
+            std::memcpy(Qcur->data, Q_data.data(), sizeof(float) * Q_data.size());
+
+            // Read full K/V from paged buffer
+            ggml_tensor * K_ctx = gc__kv_view(ctx, kv_buf_, il, 0, all_slots, (uint32_t)n_ctx);
+            ggml_tensor * V_ctx = gc__kv_view(ctx, kv_buf_, il, 1, all_slots, (uint32_t)n_ctx);
+            if (!K_ctx || !V_ctx) { ggml_free(ctx); err_ = "KV view failed"; return false; }
+            K_ctx = ggml_reshape_3d(ctx, K_ctx, n_embd_hq, nkv, (int64_t)n_ctx);
+            V_ctx = ggml_reshape_3d(ctx, V_ctx, n_embd_hv, nkv, (int64_t)n_ctx);
+
+            ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                (int64_t)n_ctx, (int64_t)n_new);
+            std::memcpy(mask->data, kq_mask_data.data(),
+                        sizeof(float) * kq_mask_data.size());
+
+            gc_attn_params_t ap_full = ap;
+            ap_full.n_tokens = (int64_t)n_new;
+
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_tensor * attn_out = gc_build_attn_mha(ctx, gf,
+                Qcur, K_ctx, V_ctx, mask, nullptr, ap_full, cb, (int)il);
+
+            ggml_tensor * w_o = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_ATTN_OUT, "weight", (int)il));
+            if (!w_o) { ggml_free(ctx); err_ = "attn_out weight missing"; return false; }
+            attn_out = ggml_mul_mat(ctx, w_o, attn_out);
+
+            if (lf.has_post_attn_norm) {
+                ggml_tensor * w_pan = gc__weight_view(ctx, loader_,
+                    find_w(GC_TENSOR_POST_ATTN_NORM, "weight", (int)il));
+                if (w_pan)
+                    attn_out = gc_build_norm(ctx, attn_out, w_pan, nullptr,
+                                             norm_params_.type, norm_params_.eps, cb, (int)il);
+            }
+
+            ggml_build_forward_expand(gf, attn_out);
+            if (ggml_graph_compute_with_ctx(ctx, gf, 1) != GGML_STATUS_SUCCESS) {
+                ggml_free(ctx); err_ = "attn compute failed"; return false;
+            }
+            std::memcpy(attn_result.data(), attn_out->data,
+                        sizeof(float) * attn_result.size());
+            ggml_free(ctx);
         }
 
-        // ── KV cache: write new K/V, then read full context ───────────────────
-        // Materialise Qcur/Kcur/Vcur before copy-out
-        ggml_build_forward_expand(gf, Qcur);
-        ggml_build_forward_expand(gf, Kcur);
-        ggml_build_forward_expand(gf, Vcur);
+        // Residual add after attention
+        for (size_t i = 0; i < residual.size(); ++i) residual[i] += attn_result[i];
+
+        // ── 2c: FFN ───────────────────────────────────────────────────────────
+        std::vector<float> ffn_result((size_t)n_embd * (size_t)n_new);
+        {
+            ggml_context * ctx = gc__ctx_make(8);
+            if (!ctx) { err_ = "ctx alloc failed (ffn)"; return false; }
+
+            ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, (int64_t)n_new);
+            std::memcpy(inp->data, residual.data(), sizeof(float) * residual.size());
+
+            ggml_tensor * w_fn = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_FFN_NORM, "weight", (int)il));
+            ggml_tensor * w_up = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_FFN_UP,   "weight", (int)il));
+            ggml_tensor * w_dn = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_FFN_DOWN, "weight", (int)il));
+            ggml_tensor * w_gt = ffn_params_.has_gate
+                ? gc__weight_view(ctx, loader_, find_w(GC_TENSOR_FFN_GATE, "weight", (int)il))
+                : nullptr;
+            if (!w_fn || !w_up || !w_dn) {
+                ggml_free(ctx); err_ = "ffn weight missing"; return false;
+            }
+
+            ggml_tensor * normed = gc_build_norm(ctx, inp, w_fn, nullptr,
+                                                  norm_params_.type, norm_params_.eps, cb, (int)il);
+            ggml_tensor * ffn_out = gc_build_ffn(ctx, normed,
+                w_up, nullptr, w_gt, nullptr, w_dn, nullptr,
+                ffn_params_.act, ffn_params_.gate_mode, cb, (int)il);
+
+            if (lf.has_post_ffn_norm) {
+                ggml_tensor * w_pfn = gc__weight_view(ctx, loader_,
+                    find_w(GC_TENSOR_POST_MLP_NORM, "weight", (int)il));
+                if (w_pfn)
+                    ffn_out = gc_build_norm(ctx, ffn_out, w_pfn, nullptr,
+                                            norm_params_.type, norm_params_.eps, cb, (int)il);
+            }
+
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, ffn_out);
+            if (ggml_graph_compute_with_ctx(ctx, gf, 1) != GGML_STATUS_SUCCESS) {
+                ggml_free(ctx); err_ = "ffn compute failed"; return false;
+            }
+            std::memcpy(ffn_result.data(), ffn_out->data,
+                        sizeof(float) * ffn_result.size());
+            ggml_free(ctx);
+        }
+
+        // Residual add after FFN
+        for (size_t i = 0; i < residual.size(); ++i) residual[i] += ffn_result[i];
+    }
+
+    // ── Step 3: output norm + lm_head ─────────────────────────────────────────
+    {
+        ggml_context * ctx = gc__ctx_make(8);
+        if (!ctx) { err_ = "ctx alloc failed (lm_head)"; return false; }
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, (int64_t)n_new);
+        std::memcpy(cur->data, residual.data(), sizeof(float) * residual.size());
+
+        if (w_output_norm_) {
+            ggml_tensor * w_on = gc__weight_view(ctx, loader_, w_output_norm_);
+            if (w_on)
+                cur = gc_build_norm(ctx, cur, w_on, nullptr,
+                                    norm_params_.type, norm_params_.eps, cb, -1);
+        }
+
+        ggml_tensor * w_out = gc__weight_view(ctx, loader_, w_output_);
+        if (!w_out) { ggml_free(ctx); err_ = "output weight view failed"; return false; }
+
+        ggml_tensor * logits_t = ggml_mul_mat(ctx, w_out, cur);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, logits_t);
         if (ggml_graph_compute_with_ctx(ctx, gf, 1) != GGML_STATUS_SUCCESS) {
-            err_ = "graph compute failed at KV materialise"; ggml_free(ctx); return false;
+            ggml_free(ctx); err_ = "lm_head compute failed"; return false;
         }
 
-        // Write K and V for the new tokens into paged buffer
-        gc__kv_write(kv_buf_, il, 0, new_slots,
-                     static_cast<float *>(Kcur->data), (uint32_t)n_new);
-        gc__kv_write(kv_buf_, il, 1, new_slots,
-                     static_cast<float *>(Vcur->data), (uint32_t)n_new);
-
-        // Read full K and V context (past + new) from paged buffer
-        ggml_tensor * K_ctx = gc__kv_view(ctx, kv_buf_, il, 0, all_slots, (uint32_t)n_ctx);
-        ggml_tensor * V_ctx = gc__kv_view(ctx, kv_buf_, il, 1, all_slots, (uint32_t)n_ctx);
-        if (!nofail(K_ctx && V_ctx, "KV view alloc failed")) return false;
-
-        K_ctx = ggml_reshape_3d(ctx, K_ctx, n_embd_hq, nkv, (int64_t)n_ctx);
-        V_ctx = ggml_reshape_3d(ctx, V_ctx, n_embd_hv, nkv, (int64_t)n_ctx);
-
-        // ── Attention (Q over full K/V context) ───────────────────────────────
-        // Update ap to reflect full context size for KV
-        gc_attn_params_t ap_full = ap;
-        ap_full.n_tokens = (int64_t)n_new; // Q tokens
-
-        ggml_tensor * attn_out = gc_build_attn_mha(ctx, gf,
-            Qcur, K_ctx, V_ctx, kq_mask, nullptr, ap_full, cb, (int)il);
-        attn_out = ggml_mul_mat(ctx, w_o, attn_out);
-
-        // Post-attention norm (Gemma2+)
-        if (lf.has_post_attn_norm) {
-            ggml_tensor * w_pan = gc__weight_view(ctx, loader_,
-                find_w(GC_TENSOR_POST_ATTN_NORM, "weight", (int)il));
-            if (w_pan) {
-                attn_out = gc_build_norm(ctx, attn_out, w_pan, nullptr,
-                                         norm_params_.type, norm_params_.eps, cb, (int)il);
-            }
-        }
-
-        cur = ggml_add(ctx, attn_out, inp_sa);
-
-        // ── FFN ───────────────────────────────────────────────────────────────
-        ggml_tensor * w_ffn_norm = gc__weight_view(ctx, loader_,
-            find_w(GC_TENSOR_FFN_NORM, "weight", (int)il));
-        if (!nofail(w_ffn_norm != nullptr, "ffn_norm weight missing")) return false;
-
-        ggml_tensor * ffn_inp = cur;
-        cur = gc_build_norm(ctx, cur, w_ffn_norm, nullptr,
-                            norm_params_.type, norm_params_.eps, cb, (int)il);
-
-        ggml_tensor * w_up   = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_FFN_UP,   "weight", (int)il));
-        ggml_tensor * w_down = gc__weight_view(ctx, loader_, find_w(GC_TENSOR_FFN_DOWN, "weight", (int)il));
-        ggml_tensor * w_gate = ffn_params_.has_gate
-            ? gc__weight_view(ctx, loader_, find_w(GC_TENSOR_FFN_GATE, "weight", (int)il))
-            : nullptr;
-        if (!nofail(w_up && w_down, "ffn weight missing")) return false;
-
-        cur = gc_build_ffn(ctx, cur,
-                           w_up,   nullptr,
-                           w_gate, nullptr,
-                           w_down, nullptr,
-                           ffn_params_.act, ffn_params_.gate_mode, cb, (int)il);
-
-        // Post-FFN norm (Gemma2+)
-        if (lf.has_post_ffn_norm) {
-            ggml_tensor * w_pfn = gc__weight_view(ctx, loader_,
-                find_w(GC_TENSOR_POST_MLP_NORM, "weight", (int)il));
-            if (w_pfn) {
-                cur = gc_build_norm(ctx, cur, w_pfn, nullptr,
-                                    norm_params_.type, norm_params_.eps, cb, (int)il);
-            }
-        }
-
-        cur = ggml_add(ctx, cur, ffn_inp);
-
-        // Reset graph for next layer (reuse context memory)
-        gf = ggml_new_graph(ctx);
+        const int64_t vocab = logits_t->ne[0];
+        const float * data  = static_cast<float *>(logits_t->data);
+        // Take logits for the last token position
+        const size_t offset = (size_t)(n_new - 1) * (size_t)vocab;
+        logits_out.assign(data + offset, data + offset + (size_t)vocab);
+        ggml_free(ctx);
     }
 
-    // ── Output norm + lm_head ─────────────────────────────────────────────────
-    if (w_output_norm_) {
-        ggml_tensor * w_on = gc__weight_view(ctx, loader_, w_output_norm_);
-        if (w_on) {
-            cur = gc_build_norm(ctx, cur, w_on, nullptr,
-                                norm_params_.type, norm_params_.eps, cb, -1);
-        }
-    }
-
-    ggml_tensor * w_out = gc__weight_view(ctx, loader_, w_output_);
-    if (!nofail(w_out != nullptr, "output weight view failed")) return false;
-
-    // logits: [vocab, n_new] — we only need the last token position
-    ggml_tensor * logits_t = ggml_mul_mat(ctx, w_out, cur);
-    ggml_build_forward_expand(gf, logits_t);
-    if (ggml_graph_compute_with_ctx(ctx, gf, 1) != GGML_STATUS_SUCCESS) {
-        err_ = "graph compute failed at lm_head"; ggml_free(ctx); return false;
-    }
-
-    // Extract logits for the last token
-    const int64_t vocab = logits_t->ne[0];
-    const float * logits_data = static_cast<float *>(logits_t->data);
-    const size_t last_offset = (size_t)(n_new - 1) * (size_t)vocab;
-    logits_out.assign(logits_data + last_offset,
-                      logits_data + last_offset + vocab);
-
-    ggml_free(ctx);
     return true;
 }
 
@@ -500,16 +556,32 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
         req_state_t & st = req_state_[e.req_id];
 
         if (e.is_prefill) {
-            // Prefill: run forward to populate KV cache, no token sampled
-            std::vector<float> dummy_logits;
+            std::vector<float> logits;
             forward(e.token_ids, e.position_ids, e.block_ids,
-                    e.num_computed, true, dummy_logits);
-            out.sampled_tokens.push_back(-1);
+                    e.num_computed, true, logits);
+
+            // Track all prompt tokens for repetition penalty.
             st.recent_tokens.insert(st.recent_tokens.end(),
                                     e.token_ids.begin(), e.token_ids.end());
             if (st.recent_tokens.size() > (size_t)cfg_.repetition_window) {
                 st.recent_tokens.erase(st.recent_tokens.begin(),
                     st.recent_tokens.end() - cfg_.repetition_window);
+            }
+
+            // On the final prefill chunk we have logits for the last prompt
+            // position — sample the first output token here (mirrors vllm
+            // GPUModelRunner: prefill produces logits and samples in one step).
+            if (e.is_last_prefill && !logits.empty()) {
+                apply_rep_penalty(logits, st);
+                const int32_t tok = sample(std::move(logits));
+                out.sampled_tokens.push_back(tok);
+                st.recent_tokens.push_back(tok);
+                if (st.recent_tokens.size() > (size_t)cfg_.repetition_window) {
+                    st.recent_tokens.erase(st.recent_tokens.begin());
+                }
+            } else {
+                // Mid-prefill chunk: no output token yet.
+                out.sampled_tokens.push_back(-1);
             }
             continue;
         }
