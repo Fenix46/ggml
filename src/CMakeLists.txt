@@ -495,3 +495,4 @@ endif()
 # ── GGUF.CORE subsystems ──────────────────────────────────────────────────────
 add_subdirectory(loader)
 add_subdirectory(arch)
+add_subdirectory(vocab)

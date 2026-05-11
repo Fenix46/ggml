@@ -377,3 +377,15 @@ target_include_directories(test_gc_arch PRIVATE
 )
 set_target_properties(test_gc_arch PROPERTIES CXX_STANDARD 17)
 add_test(NAME test_gc_arch COMMAND test_gc_arch)
+
+# Run manually:  test_gc_vocab [model.gguf]
+# Without a model path it exercises enums and default-constructed vocab only.
+add_executable(test_gc_vocab test_gc_vocab.cpp)
+target_link_libraries(test_gc_vocab PRIVATE gc_vocab gc_loader ggml)
+target_include_directories(test_gc_vocab PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/vocab
+    ${CMAKE_SOURCE_DIR}/src/loader
+    ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(test_gc_vocab PROPERTIES CXX_STANDARD 17)
+add_test(NAME test_gc_vocab COMMAND test_gc_vocab)
