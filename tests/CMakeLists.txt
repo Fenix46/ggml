@@ -354,3 +354,14 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 endif()
+
+# ── GGUF.CORE Phase 1: loader test ───────────────────────────────────────────
+# Run manually:  test_gc_loader <model.gguf>
+# Not added to CTest (requires a model file at runtime)
+add_executable(test_gc_loader test_gc_loader.cpp)
+target_link_libraries(test_gc_loader PRIVATE gc_loader ggml)
+target_include_directories(test_gc_loader PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(test_gc_loader PROPERTIES CXX_STANDARD 17)

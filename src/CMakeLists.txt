@@ -491,3 +491,6 @@ if (BUILD_SHARED_LIBS)
         target_compile_definitions(${target} PUBLIC  GGML_SHARED)
     endforeach()
 endif()
+
+# ── GGUF.CORE subsystems ──────────────────────────────────────────────────────
+add_subdirectory(loader)
