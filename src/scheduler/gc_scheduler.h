@@ -20,6 +20,18 @@ typedef enum gc_sched_policy_t {
     GC_SCHED_PRIORITY = 1,   // lower priority value = higher priority
 } gc_sched_policy_t;
 
+// ── Per-step scheduler metrics ────────────────────────────────────────────────
+
+struct gc_sched_metrics_t {
+    int num_running         = 0;   // requests in running set
+    int num_waiting         = 0;   // requests in waiting queue
+    int num_decode_tokens   = 0;   // decode tokens scheduled this step
+    int num_prefill_tokens  = 0;   // prefill tokens scheduled this step
+    int num_new_admitted    = 0;   // new requests admitted this step
+    int num_preempted       = 0;   // requests preempted this step
+    float kv_usage          = 0.f; // fraction of KV blocks in use
+};
+
 // ── Scheduler output ──────────────────────────────────────────────────────────
 // Mirrors vllm v1 SchedulerOutput, stripped of multimodal/spec-decode/PP fields.
 
@@ -48,7 +60,7 @@ struct gc_cached_req_entry_t {
 };
 
 struct gc_sched_output_t {
-    std::vector<gc_new_req_data_t>    new_reqs;      // first-time scheduled
+    std::vector<gc_new_req_data_t>     new_reqs;     // first-time scheduled
     std::vector<gc_cached_req_entry_t> cached_reqs;  // running / resumed
 
     // req_id → num tokens scheduled this step
@@ -61,6 +73,9 @@ struct gc_sched_output_t {
     // Requests preempted this step
     std::unordered_set<std::string> preempted_req_ids;
 
+    // Per-step metrics snapshot
+    gc_sched_metrics_t metrics;
+
     bool empty() const { return total_scheduled_tokens == 0; }
 };
 
@@ -72,15 +87,19 @@ struct gc_scheduler_params_t {
     int  block_size        = 16;
 
     // Scheduling limits
-    int  max_num_running   = 256;         // max concurrent requests
-    int  max_num_tokens    = 4096;        // max tokens per scheduling step (chunked prefill)
-    int  max_model_len     = 4096;
+    int  max_num_running         = 256;   // max concurrent requests
+    int  max_num_tokens          = 4096;  // max tokens per scheduling step
+    int  max_model_len           = 4096;
+    int  max_prefill_chunk_tokens = 512;  // per-step cap for prefill tokens (chunked prefill)
 
     // Policy
     gc_sched_policy_t policy = GC_SCHED_FCFS;
 
     // Prefix caching
     bool enable_prefix_cache = true;
+
+    // Tracing
+    bool enable_sched_trace = false;
 };
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -106,9 +125,14 @@ public:
     // ── Main scheduling step ──────────────────────────────────────────────────
     gc_sched_output_t schedule();
 
-    // ── Post-step update ──────────────────────────────────────────────────────
+    // ── Post-step updates ─────────────────────────────────────────────────────
+    // Called by the engine AFTER model execution confirms tokens were processed.
+    // Advances num_computed_tokens for each scheduled request.
+    void update_computed_tokens(
+        const std::unordered_map<std::string, int> & scheduled_tokens);
+
     // Called by the engine after model execution:
-    //   new_token_ids[i] = token generated for running_req[i] this step.
+    //   new_tokens[req_id] = token generated for that request this step.
     // Handles: finish detection, output_token append, block_hash update.
     void update_from_output(
         const std::unordered_map<std::string, int32_t> & new_tokens);
@@ -160,6 +184,13 @@ private:
 
     void   preempt(gc_request_t * req);
     void   finish_request(gc_request_t * req, gc_req_status_t status);
+
+    // Preempt lowest-priority running request to free KV blocks.
+    // Skips 'protect'. Returns preempted request or nullptr if nothing could be freed.
+    gc_request_t * preempt_one(
+        gc_sched_output_t & out,
+        std::vector<gc_request_t *> & scheduled_running,
+        gc_request_t * protect);
 
     // How many new tokens can be scheduled for this request this step.
     int  num_new_tokens_for(const gc_request_t * req, int token_budget) const;

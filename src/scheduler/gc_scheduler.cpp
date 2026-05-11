@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <stdexcept>
 
 // ── Constructor ───────────────────────────────────────────────────────────────
@@ -35,7 +36,6 @@ gc_request_t * gc_scheduler_t::waiting_pop() {
 }
 
 void gc_scheduler_t::waiting_push_front(gc_request_t * req) {
-    // For PRIORITY queue there's no "front" concept — just re-insert.
     if (params_.policy == GC_SCHED_PRIORITY) {
         waiting_prio_.push(req);
     } else {
@@ -55,6 +55,10 @@ void gc_scheduler_t::add_request(std::unique_ptr<gc_request_t> req) {
     } else {
         waiting_fcfs_.push_back(raw);
     }
+    if (params_.enable_sched_trace) {
+        std::fprintf(stderr, "[sched] admit req=%s waiting=%d\n",
+                     raw->request_id.c_str(), num_waiting());
+    }
 }
 
 void gc_scheduler_t::abort_request(const std::string & req_id) {
@@ -72,7 +76,6 @@ void gc_scheduler_t::abort_request(const std::string & req_id) {
                 std::remove(waiting_fcfs_.begin(), waiting_fcfs_.end(), req),
                 waiting_fcfs_.end());
         }
-        // Priority queue removal is O(n); rebuild.
         if (params_.policy == GC_SCHED_PRIORITY) {
             std::vector<gc_request_t *> tmp;
             while (!waiting_prio_.empty()) {
@@ -89,22 +92,17 @@ void gc_scheduler_t::abort_request(const std::string & req_id) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-int gc_scheduler_t::num_new_tokens_for(const gc_request_t * req, int token_budget) const {
-    int remaining = req->num_tokens() - req->num_computed_tokens;
-    if (remaining <= 0) remaining = 1;  // at least one decoding step
-    int n = std::min(remaining, token_budget);
-    n = std::min(n, params_.max_model_len - 1 - req->num_computed_tokens);
-    return n;
-}
-
 void gc_scheduler_t::preempt(gc_request_t * req) {
     assert(req->status == GC_REQ_RUNNING);
     kv_mgr_.free(req->request_id);
     req->status = GC_REQ_PREEMPTED;
     req->num_computed_tokens = 0;
     req->num_preemptions++;
-    // Put back at front of waiting queue.
     waiting_push_front(req);
+    if (params_.enable_sched_trace) {
+        std::fprintf(stderr, "[sched] preempt req=%s preemptions=%d\n",
+                     req->request_id.c_str(), req->num_preemptions);
+    }
 }
 
 void gc_scheduler_t::finish_request(gc_request_t * req, gc_req_status_t status) {
@@ -138,27 +136,18 @@ gc_cached_req_entry_t gc_scheduler_t::make_cached_entry(
     e.num_output_tokens   = req->num_output_tokens();
     e.num_prompt_tokens   = req->num_prompt_tokens();
 
-    // Always provide the COMPLETE logical block table from the KV manager.
-    // The runner maps logical positions to physical blocks via:
-    //   physical_block = block_ids[token_pos / block_size]
-    // Providing a partial table would cause writes/reads to wrong blocks.
     const gc_req_blocks_t * rb = kv_mgr_.get_blocks(req->request_id);
     if (rb) {
         auto ids = rb->block_ids();
         e.block_ids.assign(ids.begin(), ids.end());
     }
 
-    // last_token: the most recently generated output token.
-    // On the first decode step (output_token_ids empty), use the last prompt
-    // token because that is what was forwarded last during prefill and what
-    // the scheduler needs to seed the decode loop.
     if (!req->output_token_ids.empty()) {
         e.last_token = req->output_token_ids.back();
     } else if (!req->prompt_token_ids.empty()) {
         e.last_token = req->prompt_token_ids.back();
     }
 
-    // all_token_ids: prompt + output generated so far.
     e.all_token_ids.reserve(req->prompt_token_ids.size() + req->output_token_ids.size());
     e.all_token_ids.insert(e.all_token_ids.end(),
                            req->prompt_token_ids.begin(), req->prompt_token_ids.end());
@@ -167,7 +156,64 @@ gc_cached_req_entry_t gc_scheduler_t::make_cached_entry(
     return e;
 }
 
+// How many new tokens to schedule for a running request this step.
+// decode: always 1; prefill: min(remaining, chunk_cap, budget, model_len_limit)
+int gc_scheduler_t::num_new_tokens_for(const gc_request_t * req, int token_budget) const {
+    const bool is_decode = (req->num_computed_tokens >= req->num_prompt_tokens());
+    if (is_decode) {
+        // Decode: exactly 1 token, always.
+        return (token_budget >= 1) ? 1 : 0;
+    }
+    // Prefill continuation: respect chunk cap.
+    int remaining = req->num_prompt_tokens() - req->num_computed_tokens;
+    if (remaining <= 0) remaining = 1;
+    int n = std::min(remaining, token_budget);
+    n = std::min(n, params_.max_prefill_chunk_tokens);
+    n = std::min(n, params_.max_model_len - 1 - req->num_computed_tokens);
+    return n;
+}
+
+// ── Preempt lowest-priority running request ───────────────────────────────────
+// Returns the request that was preempted, or nullptr if nothing could be freed.
+gc_request_t * gc_scheduler_t::preempt_one(
+        gc_sched_output_t & out,
+        std::vector<gc_request_t *> & scheduled_running,
+        gc_request_t * protect) {
+
+    if (running_.empty()) return nullptr;
+
+    gc_request_t * victim;
+    if (params_.policy == GC_SCHED_PRIORITY) {
+        victim = *std::max_element(
+            running_.begin(), running_.end(),
+            [](const gc_request_t * a, const gc_request_t * b){ return *a < *b; });
+    } else {
+        victim = running_.back();
+    }
+
+    if (victim == protect) return nullptr;
+
+    // Un-schedule victim if already scheduled this step.
+    auto ns_it = out.num_scheduled_tokens.find(victim->request_id);
+    if (ns_it != out.num_scheduled_tokens.end()) {
+        out.total_scheduled_tokens -= ns_it->second;
+        out.num_scheduled_tokens.erase(ns_it);
+        scheduled_running.erase(
+            std::remove(scheduled_running.begin(), scheduled_running.end(), victim),
+            scheduled_running.end());
+    }
+
+    running_.erase(std::remove(running_.begin(), running_.end(), victim), running_.end());
+    out.preempted_req_ids.insert(victim->request_id);
+    preempt(victim);
+    return victim;
+}
+
 // ── Main schedule() ───────────────────────────────────────────────────────────
+// Priority:
+//   P1 – decode tokens (running requests past prefill phase)
+//   P2 – prefill continuations (running requests still in prefill)
+//   P3 – new admissions from waiting queue
 
 gc_sched_output_t gc_scheduler_t::schedule() {
     gc_sched_output_t out;
@@ -176,76 +222,83 @@ gc_sched_output_t gc_scheduler_t::schedule() {
 
     int token_budget = params_.max_num_tokens;
 
-    // ── 1. Schedule RUNNING requests ─────────────────────────────────────────
-    // Iterate running_; for each request try to allocate slots.
-    // If allocation fails, preempt the lowest-priority running request.
-
     std::vector<gc_request_t *> scheduled_running;
 
-    int idx = 0;
-    while (idx < (int)running_.size() && token_budget > 0) {
-        gc_request_t * req = running_[idx];
+    // ── P1: Decode requests ───────────────────────────────────────────────────
+    // Schedule all running requests that are in decode phase first.
+    // Decode requests consume exactly 1 token each and must not be starved.
+    for (gc_request_t * req : running_) {
+        const bool is_decode = (req->num_computed_tokens >= req->num_prompt_tokens());
+        if (!is_decode) continue;
+        if (token_budget <= 0) break;
 
-        int num_new = num_new_tokens_for(req, token_budget);
-        if (num_new <= 0) { ++idx; continue; }
-
-        // Try to extend KV slots for this running request.
         while (true) {
             const gc_req_blocks_t * rb = kv_mgr_.allocate_slots(
                 req->request_id,
-                req->num_computed_tokens + num_new,
-                {},                      // no cached blocks for running reqs
+                req->num_computed_tokens + 1,
+                {},
                 req->block_hashes,
                 req->num_computed_tokens);
 
             if (rb != nullptr) break;
 
-            // Allocation failed: preempt lowest-priority running request.
-            if (running_.empty()) break;
+            gc_request_t * v = preempt_one(out, scheduled_running, req);
+            if (v == nullptr) goto done_running;
+        }
 
-            gc_request_t * victim;
-            if (params_.policy == GC_SCHED_PRIORITY) {
-                victim = *std::max_element(
-                    running_.begin(), running_.end(),
-                    [](const gc_request_t * a, const gc_request_t * b){ return *a < *b; });
-            } else {
-                victim = running_.back();
-            }
+        scheduled_running.push_back(req);
+        out.num_scheduled_tokens[req->request_id] = 1;
+        out.total_scheduled_tokens += 1;
+        out.metrics.num_decode_tokens += 1;
+        token_budget -= 1;
 
-            if (victim == req) { goto cannot_schedule_running; }
+        if (params_.enable_sched_trace) {
+            std::fprintf(stderr, "[sched] decode req=%s computed=%d budget_left=%d\n",
+                         req->request_id.c_str(), req->num_computed_tokens, token_budget);
+        }
+    }
 
-            // Un-schedule victim if it was already scheduled this step.
-            {
-                auto ns_it = out.num_scheduled_tokens.find(victim->request_id);
-                if (ns_it != out.num_scheduled_tokens.end()) {
-                    token_budget += ns_it->second;
-                    out.total_scheduled_tokens -= ns_it->second;
-                    out.num_scheduled_tokens.erase(ns_it);
-                }
-                scheduled_running.erase(
-                    std::remove(scheduled_running.begin(), scheduled_running.end(), victim),
-                    scheduled_running.end());
-            }
+    // ── P2: Prefill continuations ─────────────────────────────────────────────
+    // Running requests still in prefill phase, capped by max_prefill_chunk_tokens.
+    for (gc_request_t * req : running_) {
+        const bool is_decode = (req->num_computed_tokens >= req->num_prompt_tokens());
+        if (is_decode) continue;  // already handled above
+        if (token_budget <= 0) break;
 
-            running_.erase(std::remove(running_.begin(), running_.end(), victim), running_.end());
-            out.preempted_req_ids.insert(victim->request_id);
-            preempt(victim);
-            if (victim == req) goto cannot_schedule_running;
+        int num_new = num_new_tokens_for(req, token_budget);
+        if (num_new <= 0) continue;
+
+        while (true) {
+            const gc_req_blocks_t * rb = kv_mgr_.allocate_slots(
+                req->request_id,
+                req->num_computed_tokens + num_new,
+                {},
+                req->block_hashes,
+                req->num_computed_tokens);
+
+            if (rb != nullptr) break;
+
+            gc_request_t * v = preempt_one(out, scheduled_running, req);
+            if (v == nullptr) goto done_running;
         }
 
         scheduled_running.push_back(req);
         out.num_scheduled_tokens[req->request_id] = num_new;
         out.total_scheduled_tokens += num_new;
+        out.metrics.num_prefill_tokens += num_new;
         token_budget -= num_new;
-        ++idx;
-        continue;
 
-    cannot_schedule_running:
-        break;
+        if (params_.enable_sched_trace) {
+            std::fprintf(stderr, "[sched] prefill-cont req=%s computed=%d chunk=%d budget_left=%d\n",
+                         req->request_id.c_str(), req->num_computed_tokens, num_new, token_budget);
+        }
     }
 
-    // ── 2. Schedule WAITING requests ─────────────────────────────────────────
-    if (!out.preempted_req_ids.empty()) goto build_output; // no new admits after preemption
+done_running:
+
+    // ── P3: New admissions ────────────────────────────────────────────────────
+    // Only admit new requests if no preemption happened this step.
+    if (!out.preempted_req_ids.empty()) goto build_output;
 
     while (!waiting_empty()
         && (int)running_.size() < params_.max_num_running
@@ -253,12 +306,12 @@ gc_sched_output_t gc_scheduler_t::schedule() {
 
         gc_request_t * req = waiting_front();
 
-        // Prefix-cache lookup.
         auto hit = kv_mgr_.find_cache_hit(req->block_hashes);
         int num_computed = hit.num_tokens;
 
         int num_new = req->num_tokens() - num_computed;
         num_new = std::min(num_new, token_budget);
+        num_new = std::min(num_new, params_.max_prefill_chunk_tokens);
         num_new = std::min(num_new, params_.max_model_len - num_computed);
         if (num_new <= 0) {
             waiting_pop();
@@ -272,7 +325,7 @@ gc_sched_output_t gc_scheduler_t::schedule() {
             req->block_hashes,
             num_computed);
 
-        if (rb == nullptr) break;  // not enough blocks; stop admitting
+        if (rb == nullptr) break;
 
         waiting_pop();
         req->status = GC_REQ_RUNNING;
@@ -283,31 +336,61 @@ gc_sched_output_t gc_scheduler_t::schedule() {
         if (is_new) {
             out.new_reqs.push_back(make_new_req_data(req));
         } else {
-            // resumed after preemption — make_cached_entry reads full block table
             out.cached_reqs.push_back(make_cached_entry(req, {}));
         }
 
         out.num_scheduled_tokens[req->request_id] = num_new;
         out.total_scheduled_tokens += num_new;
+        out.metrics.num_prefill_tokens += num_new;
+        out.metrics.num_new_admitted += 1;
         token_budget -= num_new;
+
+        if (params_.enable_sched_trace) {
+            std::fprintf(stderr, "[sched] admit-run req=%s prefix_hit=%d chunk=%d budget_left=%d\n",
+                         req->request_id.c_str(), num_computed, num_new, token_budget);
+        }
     }
 
 build_output:
-    // Fill cached_reqs for running requests scheduled in step 1.
-    // make_cached_entry reads the full block table from kv_mgr_ directly.
+    // Fill cached_reqs for running requests scheduled in P1/P2 above.
     for (gc_request_t * req : scheduled_running) {
         out.cached_reqs.push_back(make_cached_entry(req, {}));
     }
 
-    // Advance num_computed_tokens post-schedule (mirrors vllm _update_after_schedule).
-    for (auto & [req_id, n] : out.num_scheduled_tokens) {
+    // Populate metrics snapshot.
+    out.metrics.num_running   = (int)running_.size();
+    out.metrics.num_waiting   = num_waiting();
+    out.metrics.num_preempted = (int)out.preempted_req_ids.size();
+    out.metrics.kv_usage      = kv_mgr_.usage();
+
+    if (params_.enable_sched_trace) {
+        std::fprintf(stderr,
+            "[sched] step: running=%d waiting=%d decode_tok=%d prefill_tok=%d "
+            "new_admitted=%d preempted=%d kv=%.2f%%\n",
+            out.metrics.num_running, out.metrics.num_waiting,
+            out.metrics.num_decode_tokens, out.metrics.num_prefill_tokens,
+            out.metrics.num_new_admitted, out.metrics.num_preempted,
+            out.metrics.kv_usage * 100.f);
+    }
+
+    // NOTE: num_computed_tokens is NOT advanced here.
+    // It is advanced in update_computed_tokens(), called by the engine AFTER
+    // confirmed model execution. This prevents state corruption on exec failure.
+
+    return out;
+}
+
+// ── update_computed_tokens() ──────────────────────────────────────────────────
+// Called by engine AFTER model execution confirms all scheduled tokens processed.
+
+void gc_scheduler_t::update_computed_tokens(
+        const std::unordered_map<std::string, int> & scheduled_tokens) {
+    for (auto & [req_id, n] : scheduled_tokens) {
         auto it = all_reqs_.find(req_id);
         if (it != all_reqs_.end()) {
             it->second->num_computed_tokens += n;
         }
     }
-
-    return out;
 }
 
 // ── update_from_output() ──────────────────────────────────────────────────────
@@ -321,11 +404,8 @@ void gc_scheduler_t::update_from_output(
         if (req->status != GC_REQ_RUNNING) continue;
 
         req->append_output_token(tok, params_.block_size);
-
-        // Cache newly completed blocks.
         kv_mgr_.cache_blocks(req_id, req->block_hashes, req->num_computed_tokens);
 
-        // Check stop conditions.
         bool stop = false;
         gc_req_status_t fin_status = GC_REQ_FINISHED_STOPPED;
 
@@ -333,13 +413,16 @@ void gc_scheduler_t::update_from_output(
             req->sampling_params.eos_token_id >= 0 &&
             tok == req->sampling_params.eos_token_id) {
             stop = true;
-            fin_status = GC_REQ_FINISHED_STOPPED;
         } else if (req->num_output_tokens() >= req->max_tokens()) {
             stop = true;
             fin_status = GC_REQ_FINISHED_LENGTH_CAPPED;
         }
 
         if (stop) {
+            if (params_.enable_sched_trace) {
+                std::fprintf(stderr, "[sched] finish req=%s out_tokens=%d reason=%d\n",
+                             req_id.c_str(), req->num_output_tokens(), (int)fin_status);
+            }
             finish_request(req, fin_status);
         }
     }

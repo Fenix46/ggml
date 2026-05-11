@@ -175,6 +175,8 @@ gc_step_output_t gc_engine_t::step() {
     gc_model_output_t model_out;
     if (!batch.empty()) {
         model_out = runner_->execute(batch);
+        // Advance num_computed_tokens AFTER confirmed execution.
+        sched_.update_computed_tokens(sched_out.num_scheduled_tokens);
     }
 
     return process_output(sched_out, model_out);
