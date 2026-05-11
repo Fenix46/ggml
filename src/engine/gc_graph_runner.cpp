@@ -470,9 +470,10 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
             // Build K_full and V_full tensors shaped [row_size, n_ctx] by
             // gathering the physical slots in logical order.
             //
-            // FIXME: for decode/chunked prefill this still has no explicit graph
-            // dependency on same-step KV writes. Current-token K/V should be
-            // wired directly, or replaced by a real paged-attention op.
+            // Previous tokens come from the persistent KV pool. Current-step
+            // tokens are wired directly from Kcur/Vcur so the graph has an
+            // explicit data dependency and does not rely on KV-write side
+            // effects being scheduled before KV-read gathers.
             ggml_tensor * K_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
                 (int64_t)(nkv * n_embd_hq), (int64_t)n_ctx);
             ggml_set_name(K_full, "K_gathered");
@@ -482,21 +483,33 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
             ggml_set_name(V_full, "V_gathered");
 
             for (int t = 0; t < n_ctx; ++t) {
-                const size_t slot_idx = kv_pool_.token_slot_idx(e.block_ids, t);
-
-                const size_t src_off_k = slot_idx * (size_t)(nkv * n_embd_hq) * sizeof(float);
-                const size_t src_off_v = slot_idx * (size_t)(nkv * n_embd_hv) * sizeof(float);
                 const size_t dst_off_k = (size_t)t   * (size_t)(nkv * n_embd_hq) * sizeof(float);
                 const size_t dst_off_v = (size_t)t   * (size_t)(nkv * n_embd_hv) * sizeof(float);
 
-                ggml_tensor * ks = ggml_view_2d(ctx, kv_pool_.k[il],
-                    (int64_t)(nkv * n_embd_hq), 1, kv_pool_.k[il]->nb[1], src_off_k);
+                ggml_tensor * ks = nullptr;
+                ggml_tensor * vs = nullptr;
+                if (t < e.num_computed) {
+                    const size_t slot_idx = kv_pool_.token_slot_idx(e.block_ids, t);
+                    const size_t src_off_k = slot_idx * (size_t)(nkv * n_embd_hq) * sizeof(float);
+                    const size_t src_off_v = slot_idx * (size_t)(nkv * n_embd_hv) * sizeof(float);
+                    ks = ggml_view_2d(ctx, kv_pool_.k[il],
+                        (int64_t)(nkv * n_embd_hq), 1, kv_pool_.k[il]->nb[1], src_off_k);
+                    vs = ggml_view_2d(ctx, kv_pool_.v[il],
+                        (int64_t)(nkv * n_embd_hv), 1, kv_pool_.v[il]->nb[1], src_off_v);
+                } else {
+                    const int cur_idx = t - e.num_computed;
+                    ks = ggml_view_2d(ctx, Kcur_2d,
+                        (int64_t)(nkv * n_embd_hq), 1, Kcur_2d->nb[1],
+                        (size_t)cur_idx * Kcur_2d->nb[1]);
+                    vs = ggml_view_2d(ctx, Vcur_2d,
+                        (int64_t)(nkv * n_embd_hv), 1, Vcur_2d->nb[1],
+                        (size_t)cur_idx * Vcur_2d->nb[1]);
+                }
+
                 ggml_tensor * kd = ggml_view_2d(ctx, K_full,
                     (int64_t)(nkv * n_embd_hq), 1, K_full->nb[1],          dst_off_k);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, ks, kd));
 
-                ggml_tensor * vs = ggml_view_2d(ctx, kv_pool_.v[il],
-                    (int64_t)(nkv * n_embd_hv), 1, kv_pool_.v[il]->nb[1], src_off_v);
                 ggml_tensor * vd = ggml_view_2d(ctx, V_full,
                     (int64_t)(nkv * n_embd_hv), 1, V_full->nb[1],          dst_off_v);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, vs, vd));
