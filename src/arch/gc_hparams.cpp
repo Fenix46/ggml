@@ -36,6 +36,12 @@ bool gc_hparams_load(gc_hparams_t & hp, const gc_model_loader_t & loader) {
     loader.get_u32(kv(GC_KV_EMBEDDING_LENGTH),hp.n_embd,      true);
     loader.get_u32(kv(GC_KV_BLOCK_COUNT),     hp.n_layer,     true);
     loader.get_u32(kv(GC_KV_FEED_FORWARD_LENGTH), hp.n_ff,    false);
+    if (hp.n_ff == 0) {
+        loader.get_arr_u32(kv(GC_KV_FEED_FORWARD_LENGTH), hp.n_ff_arr, false);
+        if (!hp.n_ff_arr.empty()) {
+            hp.n_ff = hp.n_ff_arr.front();
+        }
+    }
 
     // If vocab_size not in KV, derive it from token_embd tensor shape later;
     // for now set a sentinel so callers can detect.
@@ -44,6 +50,18 @@ bool gc_hparams_load(gc_hparams_t & hp, const gc_model_loader_t & loader) {
     // Attention scalar defaults
     loader.get_u32(kv(GC_KV_ATTN_HEAD_COUNT),    hp.n_head,       true);
     loader.get_u32(kv(GC_KV_ATTN_HEAD_COUNT_KV), hp.n_head_kv,    false);
+    if (hp.n_head == 0) {
+        loader.get_arr_u32(kv(GC_KV_ATTN_HEAD_COUNT), hp.n_head_arr, false);
+        if (!hp.n_head_arr.empty()) {
+            hp.n_head = hp.n_head_arr.front();
+        }
+    }
+    if (hp.n_head_kv == 0) {
+        loader.get_arr_u32(kv(GC_KV_ATTN_HEAD_COUNT_KV), hp.n_head_kv_arr, false);
+        if (!hp.n_head_kv_arr.empty()) {
+            hp.n_head_kv = hp.n_head_kv_arr.front();
+        }
+    }
     if (hp.n_head_kv == 0) hp.n_head_kv = hp.n_head;
 
     loader.get_u32(kv(GC_KV_ATTN_KEY_LENGTH),   hp.n_embd_head_k, false);
