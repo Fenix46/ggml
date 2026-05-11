@@ -16,6 +16,13 @@ Source references: `llama-original/` and `vllm/` (read-only — never modify the
 3. **GGML is the only tensor library.** No PyTorch, no ONNX, no custom kernels outside GGML backends.
 4. **Source directories are read-only.** `llama-original/` and `vllm/` are reference only. Write only inside `gguf.core/` (or the ggml root if adding a subdir).
 5. **One phase at a time.** Do not start Phase N+1 until Phase N has a passing test.
+6. **Hard source boundary — KV cache and above come from vllm, not llama.cpp.** Specifically banned from Phase 6 onwards:
+   - `llama_kv_cache_*` — any slot-based or sequential KV cache logic
+   - `llama_batch` / `llama_ubatch` — replaced by `gc_batch_t` from vllm's `SchedulerOutput`
+   - `llama_context` / `llama_state` — no context-slot concept; state lives in paged KV blocks
+   - `llama_decode` / `llama_encode` — replaced by `gc_engine_step()`
+   - Any KV defrag, K-shift, sequential position remapping from llama.cpp
+   If you find yourself looking at `llama-kv-cache.cpp` for Phases 6–9, stop and look at `vllm/v1/core/` instead.
 
 ---
 
@@ -103,22 +110,29 @@ When porting a file from llama-original or vllm:
 - GQA: K/V head count may differ from Q head count — handle `n_kv_heads != n_heads`.
 - Test: single forward pass on a 2-layer toy model, check output shape.
 
-### Phase 6 — Paged KV Cache
+### Phase 6 — Paged KV Cache  *(source: vllm v1)*
+- Translate `BlockPool` + `KVCacheManager` from `vllm/v1/core/` to C++ structs + free functions.
 - Block size is a compile-time constant (`GC_KV_BLOCK_SIZE`, default 16 tokens).
-- Prefix hash = FNV-1a over the token IDs of the block's content.
-- Evict LRU free blocks first; never evict blocks owned by running sequences.
+- Prefix hash = FNV-1a over the token IDs of the block's content (mirrors vllm `PrefixCache`).
+- Evict LRU free blocks first; never evict blocks with ref_count > 0.
+- No slot arrays, no sequential KV layout from llama.cpp.
 - Test: fill cache to 90%, trigger eviction, verify LRU order and no use-after-free.
 
-### Phase 7 — Scheduler
-- Chunked prefill max tokens per step: configurable via `gc_sched_config_t.max_prefill_tokens`.
-- Preemption: recompute (re-prefill) is the default strategy; swap-to-CPU is optional.
-- Continuous batching: every `gc_scheduler_step()` call may mix prefill and decode sequences.
+### Phase 7 — Scheduler  *(source: vllm v1)*
+- Translate `Scheduler` + `RequestQueue` + `SchedulerOutput` from `vllm/v1/core/sched/` to C++.
+- Chunked prefill budget: configurable `gc_sched_config_t.max_num_batched_tokens` (= vllm's field).
+- Preemption = recompute by default (drop blocks, re-prefill on next step). Swap optional.
+- Continuous batching: every `gc_scheduler_step()` may return both prefill and decode sequences.
+- Do NOT use llama.cpp batch/decode abstractions as a reference here.
 - Test: submit 10 requests with varying lengths, verify all complete and outputs are ordered.
 
-### Phase 8 — Engine
-- `gc_engine_step()` is the single hot-loop function: scheduler → batch → ggml forward → output.
-- Worker threads own ggml contexts; the engine owns the scheduler and kv manager.
-- Streaming: deliver tokens via a registered `gc_token_callback` per request.
+### Phase 8 — Engine  *(source: vllm v1)*
+- Translate `EngineCore` + `GPUModelRunner` + `OutputProcessor` from `vllm/v1/engine/` to C++.
+- `gc_engine_step()` = scheduler.step() → gc_batch_build() → ggml_graph_compute() → output_processor.
+- `gc_batch_t` carries: token ids, position ids, block tables — built from `gc_sched_output_t`.
+- Worker threads own ggml backend contexts; engine owns scheduler + kv manager.
+- Streaming: fire `gc_token_callback_t` per request after each sampling step.
+- Sampler: port greedy/top-k/top-p/temperature/rep-penalty independently. No llama_sampler chain.
 - Test: generate 100 tokens from a loaded model, verify no memory growth over iterations.
 
 ### Phase 9 — Server

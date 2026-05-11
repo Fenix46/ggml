@@ -5,11 +5,31 @@
 Build a production-grade LLM inference engine on top of the GGML tensor graph engine.
 Name: **GGUF.CORE**. Language: C/C++17. No Python runtime dependency.
 
-Source strategy:
-- **Port from llama.cpp**: GGUF loader, tokenizer, chat template, architecture definitions, RoPE
-- **Port from vllm (v1 engine)**: paged KV cache, block pool, scheduler, request queue, output processor
-- **Original**: C++ server (OpenAI-compatible REST API via a header-only HTTP lib)
-- All ported code **renamed** under the `gc_` / `GC_` / `GcXxx` namespace. No `llama_` or `vllm` symbols survive in the public API.
+Source strategy — **hard boundary**:
+
+| Layer | Source | What we take |
+|-------|--------|-------------|
+| Loader (Phase 1) | llama.cpp | GGUF file parsing, mmap, KV getters |
+| Arch registry (Phase 2) | llama.cpp | Arch enum, hparams struct, tensor name map |
+| Tokenizer (Phase 3) | llama.cpp | BPE / SentencePiece / WordPiece logic |
+| Chat template (Phase 4) | llama.cpp | Jinja2-subset template engine |
+| Attention + RoPE (Phase 5) | llama.cpp | RoPE math, GQA graph builder |
+| **KV cache (Phase 6)** | **vllm v1** | **Block pool, KV manager, prefix cache** |
+| **Scheduler (Phase 7)** | **vllm v1** | **Continuous batching, chunked prefill, preemption** |
+| **Engine (Phase 8)** | **vllm v1** | **Engine core loop, worker, output processor** |
+| **Server (Phase 9)** | **vllm v1 + original** | **OpenAI endpoint design, C++ rewrite** |
+
+**From llama.cpp we take ONLY**: file I/O, metadata parsing, tokenizer math, chat template, RoPE coefficients, and GQA graph construction. **Nothing else.**
+
+**We do NOT port from llama.cpp**:
+- `llama_kv_cache_*` — replaced entirely by vllm block pool
+- `llama_batch` / `llama_ubatch` — replaced by `gc_batch_t` modelled on vllm's `SchedulerOutput`
+- `llama_context` / `llama_state` — no concept of a "context slot"; requests are stateless from the engine's perspective, KV state lives in paged blocks
+- `llama_decode` / `llama_encode` — replaced by `gc_engine_step()`
+- `llama_sampler*` — sampler logic ported independently, not via llama's chain API
+- Any KV defrag, sequential slot allocation, or shift logic — vllm's block table makes these unnecessary
+
+All ported code **renamed** under the `gc_` / `GC_` / `GcXxx` namespace. No `llama_` or `vllm` symbols survive in the public API.
 
 ---
 
@@ -166,22 +186,30 @@ ggml_rope_ext          → kept as-is (ggml internal)
 ### Phase 6 — Paged KV Cache
 **Source**: `vllm/vllm/v1/core/block_pool.py`, `kv_cache_manager.py`, `kv_cache_utils.py`, `kv_cache_metrics.py`
 
+**This is a direct C++ translation of vllm v1's block allocator — NOT a port of llama.cpp's kv cache.**
+No slot arrays, no sequential defrag, no `llama_kv_cache_seq_*`. Pure paged allocation.
+
 Goals:
-- Fixed-size block pool: `gc_block_pool_t` — alloc/free physical KV blocks
-- Per-sequence block table: maps logical block index → physical block id
-- Prefix caching (hash-based reuse of KV blocks for common prefixes)
-- Eviction policy: LRU on free-list
-- Metrics: hit rate, fragmentation, utilization
+- Fixed-size block pool: `gc_block_pool_t` — alloc/free physical KV blocks, ref-counted
+- Per-sequence block table: maps logical page index → physical block id (vllm `BlockTable`)
+- Prefix caching: FNV-1a hash of token content → reuse matching blocks across requests
+- Eviction: LRU free-list, never evict ref'd blocks
+- Metrics: hit rate, fragmentation, utilization (`gc_kv_cache_metrics_t`)
 - API: `gc_block_pool_create()`, `gc_kv_alloc()`, `gc_kv_free()`, `gc_kv_prefix_match()`
 
-Port strategy: translate Python class methods to C++ structs + free functions. Use `std::vector` for block tables, `std::unordered_map` for prefix hash → block_id.
+Port map:
+```
+BlockPool             → gc_block_pool_t
+KVCacheManager        → gc_kv_manager_t
+BlockTable            → std::vector<int32_t>  (logical → physical block id)
+PrefixCache           → std::unordered_map<uint64_t, int32_t>  (hash → block_id)
+```
 
 Key types:
 ```c
-typedef struct gc_block_t       { int32_t id; uint64_t content_hash; bool is_free; } gc_block_t;
-typedef struct gc_block_table_t { int32_t *block_ids; int32_t n_blocks; }            gc_block_table_t;
-typedef struct gc_block_pool_t  { /* ... */ }                                         gc_block_pool_t;
-typedef struct gc_kv_manager_t  { /* ... */ }                                         gc_kv_manager_t;
+typedef struct gc_block_t       { int32_t id; uint64_t content_hash; int32_t ref_count; } gc_block_t;
+typedef struct gc_block_pool_t  { /* total_blocks, free_list, hash map */ }               gc_block_pool_t;
+typedef struct gc_kv_manager_t  { gc_block_pool_t *pool; /* per-seq block tables */ }     gc_kv_manager_t;
 ```
 
 ---
@@ -189,34 +217,60 @@ typedef struct gc_kv_manager_t  { /* ... */ }                                   
 ### Phase 7 — Request Scheduler
 **Source**: `vllm/vllm/v1/core/sched/scheduler.py`, `request_queue.py`, `output.py`, `interface.py`
 
+**Direct C++ translation of vllm v1 Scheduler — NOT llama.cpp's decode/batch loop.**
+No `llama_batch`, no `llama_ubatch`. The scheduler owns the step budget, not the model runner.
+
 Goals:
-- Request lifecycle: `WAITING → RUNNING → PREEMPTED → FINISHED`
-- Priority queue with FCFS default, optional priority field
-- Chunked prefill: split long prompts across multiple steps
-- Preemption: swap out low-priority sequences when KV budget exhausted
-- Continuous batching: fill decode slots with new prefill tokens each step
-- Output: `gc_scheduler_output_t` — which sequences run this step, new tokens, finished flags
-- API: `gc_scheduler_create()`, `gc_scheduler_add_request()`, `gc_scheduler_step()`, `gc_scheduler_free()`
+- Request lifecycle: `WAITING → RUNNING → PREEMPTED → FINISHED` (mirrors vllm `SequenceStatus`)
+- Priority queue: FCFS default, optional priority field per request
+- Chunked prefill: configurable `max_num_batched_tokens` split across steps
+- Preemption: recompute strategy (re-prefill evicted sequences) as default; swap-to-CPU optional
+- Continuous batching: every `gc_scheduler_step()` mixes prefill + decode sequences in one batch
+- Output: `gc_sched_output_t` — running seqs, new token slots, block table updates, finished flags
+
+Port map:
+```
+Scheduler             → gc_scheduler_t
+SchedulerOutput       → gc_sched_output_t
+Request               → gc_request_t
+RequestQueue          → gc_request_queue_t  (priority deque)
+SequenceStatus        → gc_req_status_t
+```
 
 Key types:
 ```c
-typedef enum   gc_req_status_t  { GC_REQ_WAITING, GC_REQ_RUNNING, GC_REQ_PREEMPTED, GC_REQ_DONE } gc_req_status_t;
-typedef struct gc_request_t     { uint64_t id; int32_t *prompt_tokens; int32_t n_prompt; /* ... */ } gc_request_t;
-typedef struct gc_sched_output_t { gc_request_t **running; int32_t n_running; /* ... */ }           gc_sched_output_t;
+typedef enum gc_req_status_t { GC_REQ_WAITING, GC_REQ_RUNNING, GC_REQ_PREEMPTED, GC_REQ_DONE } gc_req_status_t;
+typedef struct gc_request_t  { uint64_t id; gc_req_status_t status; int32_t *tokens; int32_t n_tokens; /* sampling params */ } gc_request_t;
+typedef struct gc_sched_output_t { gc_request_t **prefill_reqs; int32_t n_prefill;
+                                   gc_request_t **decode_reqs;  int32_t n_decode;
+                                   gc_request_t **finished_reqs; int32_t n_finished; } gc_sched_output_t;
 ```
 
 ---
 
 ### Phase 8 — Inference Engine
-**Source**: `vllm/vllm/v1/engine/core.py`, `worker_base.py`, `gpu_model_runner.py`, `output_processor.py`
+**Source**: `vllm/vllm/v1/engine/core.py`, `vllm/v1/worker/gpu_model_runner.py`, `vllm/v1/engine/output_processor.py`
+
+**Modelled on vllm v1 EngineCore — NOT llama.cpp's llama_decode() loop.**
+Forward pass driven by `gc_sched_output_t`, not by caller-managed batches.
 
 Goals:
-- Drive the forward pass loop: scheduler → batch builder → ggml graph execute → output processor
-- `gc_engine_t` owns: model, tokenizer, kv manager, scheduler, worker thread pool
-- Synchronous and async (callback-based) generation modes
-- Streaming token delivery per-request
-- Sampling: greedy, top-k, top-p, temperature, repetition penalty (port from llama-sampler.cpp)
-- API: `gc_engine_create()`, `gc_engine_submit()`, `gc_engine_step()`, `gc_engine_free()`
+- Hot loop: `gc_engine_step()` = scheduler.step() → batch_builder → ggml_graph_compute() → output_processor
+- `gc_engine_t` owns: loaded model tensors, tokenizer, kv manager, scheduler, ggml backend contexts
+- Batch builder (`gc_batch_t`): assembles token ids + position ids + block tables from `gc_sched_output_t`
+- Output processor: logit extraction → sampling → token delivery via `gc_token_callback_t` per request
+- Sampling ops: greedy, top-k, top-p, temperature, repetition penalty (ported independently, not via llama sampler chain)
+- Streaming: per-token callback fired immediately after sampling, before next step
+- API: `gc_engine_create()`, `gc_engine_submit()`, `gc_engine_step()`, `gc_engine_cancel()`, `gc_engine_free()`
+
+Port map:
+```
+EngineCore            → gc_engine_t
+GPUModelRunner        → gc_model_runner_t  (drives ggml graph)
+ModelInputForGPUWithSamplingMetadata → gc_batch_t
+OutputProcessor       → gc_output_processor_t
+SamplerOutput         → gc_sample_result_t
+```
 
 ---
 
