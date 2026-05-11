@@ -501,3 +501,19 @@ add_subdirectory(attention)
 add_subdirectory(kvcache)
 add_subdirectory(scheduler)
 add_subdirectory(engine)
+
+# ── GGUF.CORE public aggregate target ────────────────────────────────────────
+add_library(gc_core INTERFACE)
+target_include_directories(gc_core INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+)
+target_link_libraries(gc_core INTERFACE
+    gc_loader
+    gc_arch
+    gc_vocab
+    gc_chat
+    gc_attention
+    gc_kvcache
+    gc_scheduler
+    gc_engine
+)
