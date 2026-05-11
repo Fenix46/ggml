@@ -22,9 +22,11 @@ static std::unique_ptr<gc_request_t> make_req(
         const std::string & id,
         int n_tokens,
         int max_tokens = 32,
-        int priority   = 0) {
+        int priority   = 0,
+        int eos_token_id = 2) {
     gc_sampling_params_t sp;
     sp.max_tokens = max_tokens;
+    sp.eos_token_id = eos_token_id;
     std::vector<int32_t> toks(n_tokens);
     for (int i = 0; i < n_tokens; ++i) toks[i] = i + 1;
     return std::make_unique<gc_request_t>(id, toks, sp, priority, 0.0);
@@ -194,8 +196,8 @@ static void test_scheduler_finish_eos() {
     sched.schedule();
     CHECK(sched.num_running() == 1);
 
-    // Token id = 0 → EOS
-    sched.update_from_output({{"r0", 0}});
+    // Token id = 2 (configured EOS) → finish
+    sched.update_from_output({{"r0", 2}});
     CHECK(sched.num_running() == 0);
 
     auto out = sched.schedule();
@@ -301,7 +303,7 @@ static void test_scheduler_prefix_cache_reuse() {
     sched.update_from_output({{"r0", 5}});
     sched.update_from_output({{"r0", 6}});
     sched.update_from_output({{"r0", 7}});
-    sched.update_from_output({{"r0", 0}});  // EOS
+    sched.update_from_output({{"r0", 2}});  // EOS
     CHECK(sched.num_running() == 0);
 
     float usage_after_r0 = sched.kv_usage();
@@ -334,7 +336,7 @@ static void test_scheduler_kv_usage_decreases_after_free() {
     sched.add_request(make_req("r0", 4, 2));
     sched.schedule();
     float before = sched.kv_usage();
-    sched.update_from_output({{"r0", 0}});  // EOS → free
+    sched.update_from_output({{"r0", 2}});  // EOS → free
     CHECK(sched.kv_usage() < before || sched.kv_usage() == 0.0f);
 }
 

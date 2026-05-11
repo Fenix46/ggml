@@ -326,8 +326,9 @@ void gc_scheduler_t::update_from_output(
         bool stop = false;
         gc_req_status_t fin_status = GC_REQ_FINISHED_STOPPED;
 
-        if (tok == 0 && !req->sampling_params.ignore_eos) {
-            // Token id 0 treated as EOS sentinel (will be replaced by vocab EOS in Phase 8)
+        if (!req->sampling_params.ignore_eos &&
+            req->sampling_params.eos_token_id >= 0 &&
+            tok == req->sampling_params.eos_token_id) {
             stop = true;
             fin_status = GC_REQ_FINISHED_STOPPED;
         } else if (req->num_output_tokens() >= req->max_tokens()) {

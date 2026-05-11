@@ -29,6 +29,8 @@ struct gc_sampling_params_t {
     float   temperature   = 1.0f;
     float   top_p         = 1.0f;
     int     top_k         = -1;
+    // EOS token id for this request. Set to < 0 to disable EOS-by-id stop.
+    int32_t eos_token_id  = 2;
     bool    ignore_eos    = false;
 };
 

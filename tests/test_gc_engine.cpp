@@ -50,9 +50,10 @@ static gc_engine_params_t base_params() {
 }
 
 static std::unique_ptr<gc_request_t> make_req(
-        const std::string & id, int n_tokens, int max_tokens = 32) {
+        const std::string & id, int n_tokens, int max_tokens = 32, int eos_token_id = 2) {
     gc_sampling_params_t sp;
     sp.max_tokens = max_tokens;
+    sp.eos_token_id = eos_token_id;
     std::vector<int32_t> toks(n_tokens);
     for (int i = 0; i < n_tokens; ++i) toks[i] = i + 1;
     return std::make_unique<gc_request_t>(id, toks, sp);
@@ -120,11 +121,11 @@ static void test_engine_step_decode() {
     CHECK(!out2.outputs.empty());
     CHECK(out2.outputs[0].req_id == "r0");
     CHECK(out2.outputs[0].token == 42);
-    CHECK(!out2.outputs[0].finished);  // token 42 ≠ EOS (0)
+    CHECK(!out2.outputs[0].finished);  // token 42 ≠ configured EOS
 }
 
 static void test_engine_step_finish_eos() {
-    // Use a runner that always returns 0 (EOS) for decode.
+    // Use a runner that always returns token 0 and configure EOS=0.
     struct EosRunner : public gc_model_runner_t {
         int num_layers() const override { return 4; }
         gc_model_output_t execute(const gc_batch_t & batch) override {
@@ -138,7 +139,7 @@ static void test_engine_step_finish_eos() {
     } eos_runner;
 
     gc_engine_t eng(base_params(), &eos_runner);
-    eng.add_request(make_req("r0", 4, 32));
+    eng.add_request(make_req("r0", 4, 32, /*eos_token_id=*/0));
 
     // Prefill
     eng.step();
