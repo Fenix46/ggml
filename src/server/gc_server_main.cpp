@@ -5,6 +5,7 @@
 #include "gc_vocab.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -103,26 +104,38 @@ int main(int argc, char ** argv) {
         ep.sched.max_model_len = hp.n_ctx_train > 0 ? (int) hp.n_ctx_train : 4096;
         ep.sched.enable_prefix_cache = true;
 
-        gc_default_model_runner_t::config_t runner_cfg;
+        gc_ggml_model_runner_t::config_t runner_cfg;
         runner_cfg.num_layers = hp.n_layer > 0 ? (int) hp.n_layer : 1;
-        if (vocab.token_eos() != GC_TOKEN_NULL) {
-            runner_cfg.decode_token = vocab.token_eos();
-        }
-        gc_default_model_runner_t runner(runner_cfg);
+        runner_cfg.vocab_size = std::max(2, (int) vocab.n_tokens());
+        runner_cfg.seed = 1;
+        runner_cfg.temperature = 0.8f;
+        runner_cfg.top_k = 40;
+        runner_cfg.top_p = 0.95f;
+        runner_cfg.repetition_penalty = 1.1f;
+        runner_cfg.repetition_window = 64;
+        gc_ggml_model_runner_t runner(runner_cfg);
         gc_engine_t engine(ep, &runner);
 
+        const int32_t eos_id = vocab.token_eos() == GC_TOKEN_NULL ? 2 : vocab.token_eos();
         gc_engine_server_runtime_t runtime(&engine, [&vocab](const std::string & text) {
             auto toks = vocab.tokenize(text, false, false);
             if (toks.empty()) {
                 toks.push_back(1);
             }
             return toks;
-        });
+        }, eos_id);
 
         gc_server_params_t sp;
         sp.host = host;
         sp.port = port;
         sp.runtime = &runtime;
+        sp.detokenize_fn = [&vocab](int32_t tok) {
+            std::string s = vocab.detokenize({tok}, false);
+            if (s.empty()) {
+                return std::string("<tok:") + std::to_string(tok) + ">";
+            }
+            return s;
+        };
 
         gc_server_t server(sp);
         if (!server.start_async()) {

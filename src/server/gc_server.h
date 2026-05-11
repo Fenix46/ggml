@@ -34,12 +34,14 @@ public:
 };
 
 using gc_server_tokenize_fn_t = std::function<std::vector<int32_t>(const std::string &)>;
+using gc_server_detokenize_fn_t = std::function<std::string(int32_t)>;
 
 class gc_engine_server_runtime_t final : public gc_server_runtime_t {
 public:
     gc_engine_server_runtime_t(
         gc_engine_t * engine,
-        gc_server_tokenize_fn_t tokenize_fn);
+        gc_server_tokenize_fn_t tokenize_fn,
+        int32_t eos_token_id = 2);
 
     std::string submit(const gc_server_request_t & req) override;
     bool cancel(const std::string & req_id) override;
@@ -48,6 +50,7 @@ public:
 private:
     gc_engine_t * engine_ = nullptr; // non-owning
     gc_server_tokenize_fn_t tokenize_fn_;
+    int32_t eos_token_id_ = 2;
     std::mutex mu_;
 };
 
@@ -55,6 +58,7 @@ struct gc_server_params_t {
     std::string host = "127.0.0.1";
     int         port = 8080;
     gc_server_runtime_t * runtime = nullptr; // non-owning; optional
+    gc_server_detokenize_fn_t detokenize_fn;
 };
 
 class gc_server_t {

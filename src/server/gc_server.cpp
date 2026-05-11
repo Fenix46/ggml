@@ -26,7 +26,15 @@ static std::string gc__extract_prompt(const json & in) {
     return oss.str();
 }
 
-static std::string gc__token_to_text(int32_t tok) {
+static std::string gc__token_to_text(int32_t tok, const gc_server_detokenize_fn_t & detok) {
+    if (detok) {
+        try {
+            return detok(tok);
+        } catch (...) {
+            // Fallback keeps serving responses even if tokenizer cannot
+            // detokenize a specific sampled id.
+        }
+    }
     return "<tok:" + std::to_string(tok) + ">";
 }
 
@@ -110,8 +118,9 @@ private:
 
 gc_engine_server_runtime_t::gc_engine_server_runtime_t(
         gc_engine_t * engine,
-        gc_server_tokenize_fn_t tokenize_fn)
-    : engine_(engine), tokenize_fn_(std::move(tokenize_fn)) {}
+        gc_server_tokenize_fn_t tokenize_fn,
+        int32_t eos_token_id)
+    : engine_(engine), tokenize_fn_(std::move(tokenize_fn)), eos_token_id_(eos_token_id) {}
 
 std::string gc_engine_server_runtime_t::submit(const gc_server_request_t & req) {
     std::lock_guard<std::mutex> lg(mu_);
@@ -125,7 +134,7 @@ std::string gc_engine_server_runtime_t::submit(const gc_server_request_t & req) 
 
     gc_sampling_params_t sp;
     sp.max_tokens = req.max_tokens > 0 ? req.max_tokens : 16;
-    sp.eos_token_id = 2;
+    sp.eos_token_id = eos_token_id_;
     sp.ignore_eos = false;
 
     engine_->add_request(std::make_unique<gc_request_t>(req.id, toks, sp));
@@ -236,7 +245,7 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                                     {"object", "chat.completion.chunk"},
                                     {"created", gc__unix_time_now()},
                                     {"model", "gc-server"},
-                                    {"choices", {{{"index", 0}, {"delta", {{"content", gc__token_to_text(ev.token)}}}, {"finish_reason", nullptr}}}}
+                                    {"choices", {{{"index", 0}, {"delta", {{"content", gc__token_to_text(ev.token, params_.detokenize_fn)}}}, {"finish_reason", nullptr}}}}
                                 };
                                 std::string evt = "data: " + tok_chunk.dump() + "\n\n";
                                 sink.write(evt.data(), evt.size());
@@ -273,7 +282,7 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
             for (const auto & ev : evs) {
                 if (ev.req_id != rid) continue;
                 if (ev.token >= 0) {
-                    text += gc__token_to_text(ev.token);
+                    text += gc__token_to_text(ev.token, params_.detokenize_fn);
                     completion_tokens++;
                 }
                 finished = ev.finished;
