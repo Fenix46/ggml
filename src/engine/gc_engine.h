@@ -70,6 +70,26 @@ public:
     virtual int num_layers() const = 0;
 };
 
+// Minimal concrete runner used by server/integration wiring before the
+// architecture-specific GGML runner is fully implemented.
+class gc_default_model_runner_t final : public gc_model_runner_t {
+public:
+    struct config_t {
+        int num_layers = 1;
+        int32_t decode_token = 42;
+        bool emit_token_on_prefill = false;
+    };
+
+    gc_default_model_runner_t();
+    explicit gc_default_model_runner_t(config_t cfg);
+
+    gc_model_output_t execute(const gc_batch_t & batch) override;
+    int num_layers() const override;
+
+private:
+    config_t cfg_;
+};
+
 // ── Engine params ─────────────────────────────────────────────────────────────
 
 struct gc_engine_params_t {

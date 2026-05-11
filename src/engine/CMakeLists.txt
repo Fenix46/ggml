@@ -1,4 +1,7 @@
-add_library(gc_engine STATIC gc_engine.cpp)
+add_library(gc_engine STATIC
+    gc_engine.cpp
+    gc_default_model_runner.cpp
+)
 
 target_include_directories(gc_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

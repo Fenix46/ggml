@@ -62,7 +62,10 @@ static std::unique_ptr<gc_request_t> make_req(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 static void test_engine_constructor() {
-    MockRunner runner;
+    gc_default_model_runner_t::config_t cfg;
+    cfg.num_layers = 4;
+    cfg.decode_token = 17;
+    gc_default_model_runner_t runner(cfg);
     auto p = base_params();
     gc_engine_t eng(p, &runner);
     CHECK(!eng.has_work());
@@ -106,7 +109,10 @@ static void test_engine_step_prefill() {
 }
 
 static void test_engine_step_decode() {
-    MockRunner runner;
+    gc_default_model_runner_t::config_t cfg;
+    cfg.num_layers = 4;
+    cfg.decode_token = 42;
+    gc_default_model_runner_t runner(cfg);
     gc_engine_t eng(base_params(), &runner);
 
     eng.add_request(make_req("r0", 4, 32));
@@ -122,6 +128,39 @@ static void test_engine_step_decode() {
     CHECK(out2.outputs[0].req_id == "r0");
     CHECK(out2.outputs[0].token == 42);
     CHECK(!out2.outputs[0].finished);  // token 42 ≠ configured EOS
+}
+
+static void test_default_runner_prefill_behavior() {
+    gc_default_model_runner_t::config_t cfg;
+    cfg.num_layers = 3;
+    cfg.decode_token = 9;
+    cfg.emit_token_on_prefill = false;
+    gc_default_model_runner_t runner(cfg);
+    gc_batch_t b;
+    gc_batch_entry_t e0;
+    e0.req_id = "r0";
+    e0.token_ids = {1, 2};
+    e0.block_ids = {0};
+    e0.num_computed = 0;
+    e0.num_new_tokens = 2;
+    e0.is_prefill = true;
+    b.entries.push_back(e0);
+
+    gc_batch_entry_t e1;
+    e1.req_id = "r1";
+    e1.token_ids = {3};
+    e1.block_ids = {1};
+    e1.num_computed = 2;
+    e1.num_new_tokens = 1;
+    e1.is_prefill = false;
+    b.entries.push_back(e1);
+
+    const gc_model_output_t out = runner.execute(b);
+    CHECK(runner.num_layers() == 3);
+    CHECK(out.req_ids.size() == 2);
+    CHECK(out.sampled_tokens.size() == 2);
+    CHECK(out.sampled_tokens[0] == -1);
+    CHECK(out.sampled_tokens[1] == 9);
 }
 
 static void test_engine_step_finish_eos() {
@@ -320,6 +359,7 @@ int main() {
     test_engine_step_empty();
     test_engine_step_prefill();
     test_engine_step_decode();
+    test_default_runner_prefill_behavior();
     test_engine_step_finish_eos();
     test_engine_step_finish_max_tokens();
     test_engine_abort_waiting();
