@@ -469,3 +469,23 @@ target_include_directories(test_gc_model_integration PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 set_target_properties(test_gc_model_integration PROPERTIES CXX_STANDARD 17)
+
+# Run manually: test_gc_generation_runtime <model.gguf> [--rounds=N] [--max-tokens=N]
+add_executable(test_gc_generation_runtime test_gc_generation_runtime.cpp)
+target_link_libraries(test_gc_generation_runtime PRIVATE
+    gc_loader
+    gc_arch
+    gc_vocab
+    gc_engine
+    ggml
+)
+target_include_directories(test_gc_generation_runtime PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/loader
+    ${CMAKE_SOURCE_DIR}/src/arch
+    ${CMAKE_SOURCE_DIR}/src/vocab
+    ${CMAKE_SOURCE_DIR}/src/engine
+    ${CMAKE_SOURCE_DIR}/src/scheduler
+    ${CMAKE_SOURCE_DIR}/src/kvcache
+    ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(test_gc_generation_runtime PROPERTIES CXX_STANDARD 17)
