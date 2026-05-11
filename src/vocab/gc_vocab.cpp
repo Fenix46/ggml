@@ -1675,7 +1675,7 @@ struct gc_vocab_t::impl {
     std::vector<token_data>                      id_to_token;
 
     std::vector<gc_token_t> cache_special_tokens;
-    std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
+    std::vector<std::string> cache_token_to_piece; // token_to_piece(special = true) cache
     struct pair_hash {
         size_t operator()(const std::pair<std::string, std::string> & p) const {
             return std::hash<std::string>{}(p.first) ^  //create some hash for pair
