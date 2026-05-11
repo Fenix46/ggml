@@ -99,12 +99,23 @@ static std::vector<int> topk_indices(const std::vector<float> & logits, int k) {
     return idx;
 }
 
-static void compare_logits(const std::vector<float> & got, const std::vector<float> & ref) {
+struct logits_cmp_t {
+    double mean_abs = 0.0;
+    float max_abs = 0.0f;
+    int max_idx = 0;
+    int top10_overlap = 0;
+};
+
+static logits_cmp_t compare_logits(
+        const char * label,
+        const std::vector<float> & got,
+        const std::vector<float> & ref) {
+    logits_cmp_t stats;
     CHECK(!got.empty());
     CHECK(got.size() == ref.size());
     if (got.empty() || got.size() != ref.size()) {
-        std::fprintf(stderr, "INFO logits_shape got=%zu ref=%zu\n", got.size(), ref.size());
-        return;
+        std::fprintf(stderr, "INFO %s_logits_shape got=%zu ref=%zu\n", label, got.size(), ref.size());
+        return stats;
     }
 
     double sum_abs = 0.0;
@@ -118,6 +129,9 @@ static void compare_logits(const std::vector<float> & got, const std::vector<flo
             max_idx = (int)i;
         }
     }
+    stats.mean_abs = sum_abs / (double)got.size();
+    stats.max_abs = max_abs;
+    stats.max_idx = max_idx;
 
     const std::vector<int> got_top = topk_indices(got, 10);
     const std::vector<int> ref_top = topk_indices(ref, 10);
@@ -127,16 +141,18 @@ static void compare_logits(const std::vector<float> & got, const std::vector<flo
             if (a == b) ++overlap;
         }
     }
+    stats.top10_overlap = overlap;
 
-    std::fprintf(stderr, "INFO logits_cmp size=%zu mean_abs=%.6g max_abs=%.6g max_idx=%d top10_overlap=%d/10\n",
-                 got.size(), sum_abs / (double)got.size(), max_abs, max_idx, overlap);
-    std::fprintf(stderr, "INFO gc_top10:");
+    std::fprintf(stderr, "INFO %s_logits_cmp size=%zu mean_abs=%.6g max_abs=%.6g max_idx=%d top10_overlap=%d/10\n",
+                 label, got.size(), stats.mean_abs, stats.max_abs, stats.max_idx, stats.top10_overlap);
+    std::fprintf(stderr, "INFO %s_got_top10:", label);
     for (int i : got_top) std::fprintf(stderr, " %d(%.4g)", i, got[(size_t)i]);
-    std::fprintf(stderr, "\nINFO ref_top10:");
+    std::fprintf(stderr, "\nINFO %s_ref_top10:", label);
     for (int i : ref_top) std::fprintf(stderr, " %d(%.4g)", i, ref[(size_t)i]);
     std::fprintf(stderr, "\n");
 
     CHECK(overlap > 0);
+    return stats;
 }
 
 static run_result_t run_once(
@@ -311,7 +327,8 @@ int main(int argc, char ** argv) {
             CHECK(max_tokens == 1);
             std::vector<float> ref;
             CHECK(read_logits_bin(compare_logits_path, ref));
-            compare_logits(full.logits, ref);
+            const logits_cmp_t ref_cmp = compare_logits("ref", full.logits, ref);
+            CHECK(ref_cmp.top10_overlap >= 8);
         }
 
         if (check_chunking) {
@@ -322,6 +339,11 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "INFO chunked_first_token=%d piece='%s'\n", chunked.token, chunked.piece.c_str());
             CHECK(chunked.token == full.token);
             CHECK(chunked.tokens == full.tokens);
+            const logits_cmp_t chunk_cmp = compare_logits("chunked", chunked.logits, full.logits);
+            // Token-by-token prefill changes the order of floating point ops vs full
+            // prefill; require identical greedy behavior and stable top candidates.
+            CHECK(chunk_cmp.mean_abs < 0.25);
+            CHECK(chunk_cmp.top10_overlap == 10);
         }
     } catch (const std::exception & e) {
         std::fprintf(stderr, "EXCEPTION: %s\n", e.what());
