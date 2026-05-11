@@ -447,3 +447,25 @@ target_include_directories(test_gc_server PRIVATE
 )
 set_target_properties(test_gc_server PROPERTIES CXX_STANDARD 17)
 add_test(NAME test_gc_server COMMAND test_gc_server)
+
+# Run manually: test_gc_model_integration <model.gguf>
+add_executable(test_gc_model_integration test_gc_model_integration.cpp)
+target_link_libraries(test_gc_model_integration PRIVATE
+    gc_loader
+    gc_arch
+    gc_vocab
+    gc_chat
+    gc_engine
+    ggml
+)
+target_include_directories(test_gc_model_integration PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/loader
+    ${CMAKE_SOURCE_DIR}/src/arch
+    ${CMAKE_SOURCE_DIR}/src/vocab
+    ${CMAKE_SOURCE_DIR}/src/chat
+    ${CMAKE_SOURCE_DIR}/src/engine
+    ${CMAKE_SOURCE_DIR}/src/scheduler
+    ${CMAKE_SOURCE_DIR}/src/kvcache
+    ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(test_gc_model_integration PROPERTIES CXX_STANDARD 17)
