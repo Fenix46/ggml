@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -88,6 +90,42 @@ public:
 
 private:
     config_t cfg_;
+};
+
+// GGML-oriented runner with real sampling controls.
+// This is a production-facing runner scaffold: it manages per-request sampling
+// state and applies top-k/top-p/temperature/repetition-penalty on logits.
+class gc_ggml_model_runner_t final : public gc_model_runner_t {
+public:
+    struct config_t {
+        int num_layers = 1;
+        int vocab_size = 32000;
+        uint64_t seed = 1;
+        float temperature = 1.0f;
+        int top_k = 40;
+        float top_p = 0.95f;
+        float repetition_penalty = 1.1f;
+        int repetition_window = 64;
+    };
+
+    gc_ggml_model_runner_t();
+    explicit gc_ggml_model_runner_t(config_t cfg);
+    gc_model_output_t execute(const gc_batch_t & batch) override;
+    int num_layers() const override;
+
+private:
+    struct req_state_t {
+        std::vector<int32_t> recent_tokens;
+        uint64_t step_count = 0;
+    };
+
+    config_t cfg_;
+    std::mt19937_64 rng_;
+    std::unordered_map<std::string, req_state_t> req_state_;
+
+    std::vector<float> build_logits(const gc_batch_entry_t & e, req_state_t & st) const;
+    int32_t sample_token(std::vector<float> logits);
+    void apply_repetition_penalty(std::vector<float> & logits, const req_state_t & st) const;
 };
 
 // ── Engine params ─────────────────────────────────────────────────────────────

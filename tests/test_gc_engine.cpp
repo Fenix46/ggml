@@ -163,6 +163,40 @@ static void test_default_runner_prefill_behavior() {
     CHECK(out.sampled_tokens[1] == 9);
 }
 
+static void test_ggml_runner_sampling_basic() {
+    gc_ggml_model_runner_t::config_t cfg;
+    cfg.num_layers = 2;
+    cfg.vocab_size = 256;
+    cfg.seed = 123;
+    cfg.temperature = 0.8f;
+    cfg.top_k = 32;
+    cfg.top_p = 0.9f;
+    cfg.repetition_penalty = 1.1f;
+    cfg.repetition_window = 16;
+    gc_ggml_model_runner_t runner(cfg);
+
+    gc_batch_t b;
+    gc_batch_entry_t e0;
+    e0.req_id = "s0";
+    e0.token_ids = {1, 2, 3};
+    e0.is_prefill = true;
+    b.entries.push_back(e0);
+
+    gc_batch_entry_t e1;
+    e1.req_id = "s1";
+    e1.token_ids = {10};
+    e1.is_prefill = false;
+    b.entries.push_back(e1);
+
+    const gc_model_output_t out = runner.execute(b);
+    CHECK(runner.num_layers() == 2);
+    CHECK(out.req_ids.size() == 2);
+    CHECK(out.sampled_tokens.size() == 2);
+    CHECK(out.sampled_tokens[0] == -1);
+    CHECK(out.sampled_tokens[1] >= 0);
+    CHECK(out.sampled_tokens[1] < 256);
+}
+
 static void test_engine_step_finish_eos() {
     // Use a runner that always returns token 0 and configure EOS=0.
     struct EosRunner : public gc_model_runner_t {
@@ -360,6 +394,7 @@ int main() {
     test_engine_step_prefill();
     test_engine_step_decode();
     test_default_runner_prefill_behavior();
+    test_ggml_runner_sampling_basic();
     test_engine_step_finish_eos();
     test_engine_step_finish_max_tokens();
     test_engine_abort_waiting();
