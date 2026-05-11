@@ -5,6 +5,7 @@
 #include "vendor/json.hpp"
 
 #include <chrono>
+#include <ctime>
 #include <sstream>
 
 using json = nlohmann::json;
@@ -27,6 +28,10 @@ static std::string gc__extract_prompt(const json & in) {
 
 static std::string gc__token_to_text(int32_t tok) {
     return "<tok:" + std::to_string(tok) + ">";
+}
+
+static int64_t gc__unix_time_now() {
+    return static_cast<int64_t>(std::time(nullptr));
 }
 
 class gc_mock_runtime_t : public gc_server_runtime_t {
@@ -158,18 +163,18 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
             in = json::parse(req.body);
         } catch (...) {
             res.status = 400;
-            res.set_content(R"({"error":{"message":"invalid JSON body"}})", "application/json");
+            res.set_content(R"({"error":{"message":"invalid JSON body","type":"invalid_request_error"}})", "application/json");
             return;
         }
 
         if (!in.contains("model") || !in["model"].is_string()) {
             res.status = 400;
-            res.set_content(R"({"error":{"message":"missing or invalid 'model'"}})", "application/json");
+            res.set_content(R"({"error":{"message":"missing or invalid 'model'","type":"invalid_request_error"}})", "application/json");
             return;
         }
         if (!in.contains("messages") || !in["messages"].is_array()) {
             res.status = 400;
-            res.set_content(R"({"error":{"message":"missing or invalid 'messages'"}})", "application/json");
+            res.set_content(R"({"error":{"message":"missing or invalid 'messages'","type":"invalid_request_error"}})", "application/json");
             return;
         }
 
@@ -193,6 +198,8 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                     json role_chunk = {
                         {"id", cid},
                         {"object", "chat.completion.chunk"},
+                        {"created", gc__unix_time_now()},
+                        {"model", "gc-server"},
                         {"choices", {{{"index", 0}, {"delta", {{"role", "assistant"}}}, {"finish_reason", nullptr}}}}
                     };
                     std::string role_evt = "data: " + role_chunk.dump() + "\n\n";
@@ -208,6 +215,8 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                                 json tok_chunk = {
                                     {"id", cid},
                                     {"object", "chat.completion.chunk"},
+                                    {"created", gc__unix_time_now()},
+                                    {"model", "gc-server"},
                                     {"choices", {{{"index", 0}, {"delta", {{"content", gc__token_to_text(ev.token)}}}, {"finish_reason", nullptr}}}}
                                 };
                                 std::string evt = "data: " + tok_chunk.dump() + "\n\n";
@@ -221,6 +230,8 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                     json end_chunk = {
                         {"id", cid},
                         {"object", "chat.completion.chunk"},
+                        {"created", gc__unix_time_now()},
+                        {"model", "gc-server"},
                         {"choices", {{{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}}}
                     };
                     std::string end_evt = "data: " + end_chunk.dump() + "\n\n";
@@ -250,12 +261,18 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
         json out = {
             {"id", cid},
             {"object", "chat.completion"},
+            {"created", gc__unix_time_now()},
             {"model", reqv.model},
             {"choices", {{
                 {"index", 0},
                 {"message", {{"role", "assistant"}, {"content", text}}},
                 {"finish_reason", "stop"}
-            }}}
+            }}},
+            {"usage", {
+                {"prompt_tokens", 0},
+                {"completion_tokens", 0},
+                {"total_tokens", 0}
+            }}
         };
         res.status = 200;
         res.set_content(out.dump(), "application/json");

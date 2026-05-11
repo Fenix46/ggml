@@ -18,6 +18,16 @@ static int g_fail = 0;
     else { ++g_fail; fprintf(stderr, "FAIL  %s:%d  %s\n", __FILE__, __LINE__, #cond); } \
 } while (0)
 
+static bool parse_json_checked(const std::string & body, json & out) {
+    try {
+        out = json::parse(body);
+        return true;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "JSON parse failed: %s\nBODY: %s\n", e.what(), body.c_str());
+        return false;
+    }
+}
+
 class ServerTestRunner : public gc_model_runner_t {
 public:
     int num_layers() const override { return 1; }
@@ -56,9 +66,13 @@ int main() {
     auto resp = cli.Post("/v1/chat/completions", req.dump(), "application/json");
     CHECK(resp != nullptr);
     CHECK(resp->status == 200);
-    auto out = json::parse(resp->body);
+    json out;
+    CHECK(parse_json_checked(resp->body, out));
     CHECK(out["object"] == "chat.completion");
+    CHECK(out.contains("id"));
+    CHECK(out.contains("created"));
     CHECK(out["choices"].is_array());
+    CHECK(out.contains("usage"));
 
     // Stream chat completion
     req["stream"] = true;
@@ -66,6 +80,16 @@ int main() {
     CHECK(sresp != nullptr);
     CHECK(sresp->status == 200);
     CHECK(sresp->body.find("data: [DONE]") != std::string::npos);
+
+    // Invalid body shape -> OpenAI-style error object
+    json bad = {{"model", "test-model"}};
+    auto badresp = cli.Post("/v1/chat/completions", bad.dump(), "application/json");
+    CHECK(badresp != nullptr);
+    CHECK(badresp->status == 400);
+    json berr;
+    CHECK(parse_json_checked(badresp->body, berr));
+    CHECK(berr.contains("error"));
+    CHECK(berr["error"].contains("type"));
 
     server.stop();
     CHECK(!server.is_running());
@@ -97,11 +121,15 @@ int main() {
     CHECK(server2.start_async());
 
     httplib::Client cli2(p2.host, p2.port);
+    req["stream"] = false;
     auto resp2 = cli2.Post("/v1/chat/completions", req.dump(), "application/json");
     CHECK(resp2 != nullptr);
     CHECK(resp2->status == 200);
-    auto out2 = json::parse(resp2->body);
+    json out2;
+    CHECK(parse_json_checked(resp2->body, out2));
     CHECK(out2["object"] == "chat.completion");
+    CHECK(out2.contains("id"));
+    CHECK(out2.contains("created"));
     CHECK(out2["choices"].is_array());
     CHECK(out2["choices"][0]["message"]["role"] == "assistant");
 
