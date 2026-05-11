@@ -1,5 +1,5 @@
 #include "gc_arch.h"
-#include "gc_arch_llama.h"
+#include "gc_arch_runtime.h"
 #include "gc_hparams.h"
 #include "gc_gguf_loader.h"
 #include "gc_common.h"
@@ -128,10 +128,10 @@ static void test_llama_arch_adapter() {
     hp.f_max_alibi_bias = 0.0f;
 
     std::string err;
-    CHECK(gc_arch_llama_validate_hparams(hp, &err), "llama hparams validation passes");
+    CHECK(gc_arch_runtime_validate_hparams(hp, &err), "runtime llama hparams validation passes");
 
     gc_attn_params_t ap;
-    CHECK(gc_arch_llama_build_attn_params(hp, 0, 128, ap, &err), "llama attn params build passes");
+    CHECK(gc_arch_runtime_build_attn_params(hp, 0, 128, ap, &err), "runtime llama attn params build passes");
     CHECK(ap.n_head_q == 32, "attn params q heads");
     CHECK(ap.n_head_kv == 8, "attn params kv heads");
     CHECK(ap.n_embd_head_q == 128, "attn params q head dim");
@@ -140,7 +140,7 @@ static void test_llama_arch_adapter() {
     CHECK(fabsf(ap.kq_scale - (1.0f / sqrtf(128.0f))) < 1e-6f, "attn params default kq scale");
 
     gc_rope_params_t rp;
-    CHECK(gc_arch_llama_build_rope_params(hp, rp, &err), "llama rope params build passes");
+    CHECK(gc_arch_runtime_build_rope_params(hp, rp, &err), "runtime llama rope params build passes");
     CHECK(rp.n_dims == 128, "rope dims default to head dim");
     CHECK(rp.mode == GGML_ROPE_TYPE_NEOX, "rope mode is NEOX");
     CHECK(rp.n_ctx_orig == 8192, "rope n_ctx_orig");
@@ -148,8 +148,25 @@ static void test_llama_arch_adapter() {
     CHECK(fabsf(rp.freq_scale - 0.125f) < 1e-6f, "rope linear freq scale");
 
     hp.f_attn_scale = 0.5f;
-    CHECK(gc_arch_llama_build_attn_params(hp, 0, 64, ap, &err), "attn params build with explicit scale");
+    CHECK(gc_arch_runtime_build_attn_params(hp, 0, 64, ap, &err), "runtime attn params build with explicit scale");
     CHECK(fabsf(ap.kq_scale - 0.5f) < 1e-6f, "attn params explicit kq scale");
+}
+
+static void test_runtime_dispatch_unsupported() {
+    gc_hparams_t hp;
+    hp.arch = GC_ARCH_GEMMA2;
+    hp.n_embd = 2304;
+    hp.n_layer = 26;
+    hp.n_head = 8;
+    hp.n_head_kv = 4;
+
+    gc_attn_params_t ap;
+    gc_rope_params_t rp;
+    std::string err;
+
+    CHECK(!gc_arch_runtime_validate_hparams(hp, &err), "runtime rejects unsupported arch until implemented");
+    CHECK(!gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime rejects unsupported attn build");
+    CHECK(!gc_arch_runtime_build_rope_params(hp, rp, &err), "runtime rejects unsupported rope build");
 }
 
 // ── Hparams from file (optional) ──────────────────────────────────────────────
@@ -170,9 +187,9 @@ static void test_hparams_from_file(const char * path) {
         std::string err;
         gc_attn_params_t ap;
         gc_rope_params_t rp;
-        CHECK(gc_arch_llama_validate_hparams(hp, &err), "llama file hparams valid");
-        CHECK(gc_arch_llama_build_attn_params(hp, 0, 16, ap, &err), "llama file attn params build");
-        CHECK(gc_arch_llama_build_rope_params(hp, rp, &err), "llama file rope params build");
+        CHECK(gc_arch_runtime_validate_hparams(hp, &err), "runtime llama file hparams valid");
+        CHECK(gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime llama file attn params build");
+        CHECK(gc_arch_runtime_build_rope_params(hp, rp, &err), "runtime llama file rope params build");
         CHECK(ap.n_embd_head_q > 0, "llama file attn head dim > 0");
         CHECK(rp.n_dims > 0, "llama file rope dims > 0");
     }
@@ -196,6 +213,7 @@ int main(int argc, char ** argv) {
     test_tensor_names();
     test_tensor_info();
     test_llama_arch_adapter();
+    test_runtime_dispatch_unsupported();
 
     if (argc >= 2) {
         fprintf(stdout, "\n[hparams from file: %s]\n", argv[1]);

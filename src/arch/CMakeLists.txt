@@ -2,6 +2,7 @@ add_library(gc_arch STATIC
     gc_arch.cpp
     gc_hparams.cpp
     gc_arch_llama.cpp
+    gc_arch_runtime.cpp
 )
 
 target_include_directories(gc_arch PUBLIC
