@@ -389,3 +389,12 @@ target_include_directories(test_gc_vocab PRIVATE
 )
 set_target_properties(test_gc_vocab PROPERTIES CXX_STANDARD 17)
 add_test(NAME test_gc_vocab COMMAND test_gc_vocab)
+
+# Run manually:  test_gc_chat
+add_executable(test_gc_chat test_gc_chat.cpp)
+target_link_libraries(test_gc_chat PRIVATE gc_chat)
+target_include_directories(test_gc_chat PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/chat
+)
+set_target_properties(test_gc_chat PROPERTIES CXX_STANDARD 17)
+add_test(NAME test_gc_chat COMMAND test_gc_chat)
