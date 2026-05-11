@@ -72,12 +72,16 @@ public:
     virtual int num_layers() const = 0;
 };
 
+class gc_ggml_model_runner_t;
+
 // Minimal concrete runner used by server/integration wiring before the
 // architecture-specific GGML runner is fully implemented.
 class gc_default_model_runner_t final : public gc_model_runner_t {
 public:
     struct config_t {
         int num_layers = 1;
+        // Kept for backward compatibility; default runner now delegates to
+        // the GGML-oriented sampler runner across the framework.
         int32_t decode_token = 42;
         bool emit_token_on_prefill = false;
     };
@@ -90,6 +94,7 @@ public:
 
 private:
     config_t cfg_;
+    std::unique_ptr<gc_ggml_model_runner_t> impl_;
 };
 
 // GGML-oriented runner with real sampling controls.
