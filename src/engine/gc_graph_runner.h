@@ -196,9 +196,12 @@ private:
     // Build the full forward graph for one request.
     // Returns the logits tensor (output, F32 [vocab_size, n_new]).
     // All tensors are no_alloc; allocation is deferred to galloc_.
+    // *kq_mask_out receives the causal mask tensor so execute() can populate it
+    // after ggml_gallocr_alloc_graph (that is when the tensor gets a buffer).
     ggml_tensor * build_graph(ggml_context * ctx,
                               ggml_cgraph  * gf,
-                              const gc_batch_entry_t & e);
+                              const gc_batch_entry_t & e,
+                              ggml_tensor ** kq_mask_out);
 
     // ── Weight view ───────────────────────────────────────────────────────────
     const gc_tensor_weight_t * find_w(gc_tensor_role_t role,

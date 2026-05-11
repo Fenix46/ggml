@@ -297,14 +297,15 @@ const gc_tensor_weight_t * gc_graph_runner_t::find_w(gc_tensor_role_t role,
 
 ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
                                                ggml_cgraph  * gf,
-                                               const gc_batch_entry_t & e) {
+                                               const gc_batch_entry_t & e,
+                                               ggml_tensor ** kq_mask_out) {
     const int n_new = (int)e.token_ids.size();
     const int n_ctx = e.num_computed + n_new;
     const gc_graph_cb_t cb = [](ggml_tensor *, const char *, int) {};
 
     // ── Inputs (reuse pre-allocated CPU tensors, write data) ─────────────────
-    // inp_tokens_ and inp_pos_ are already allocated — we just write new data.
-    // Use ggml_backend_tensor_set for backend-agnostic write.
+    // inp_tokens_ and inp_pos_ are backed by inp_buf_ (CPU, pre-allocated).
+    // ggml_backend_tensor_set is safe here — buffer is already set.
     ggml_backend_tensor_set(inp_tokens_, e.token_ids.data(),
                              0, sizeof(int32_t) * (size_t)n_new);
     ggml_backend_tensor_set(inp_pos_,    e.position_ids.data(),
@@ -322,22 +323,14 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
     // cur: F32 [n_embd, n_new]  (dequantized by ggml_get_rows if quantized)
 
     // ── Causal mask ───────────────────────────────────────────────────────────
-    // Built as a CPU tensor uploaded to the graph context.
+    // Allocated inside the no_alloc graph context — gallocr will back it.
+    // We mark it as input so gallocr keeps it non-overlapping and writable.
+    // Data is written by execute() AFTER ggml_gallocr_alloc_graph gives it a buffer.
     ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
                                                 (int64_t)n_ctx, (int64_t)n_new);
+    ggml_set_name(kq_mask, "kq_mask");
     ggml_set_input(kq_mask);
-    {
-        std::vector<float> mask_data((size_t)n_ctx * (size_t)n_new);
-        for (int q = 0; q < n_new; ++q) {
-            const int q_pos = e.num_computed + q;
-            for (int k = 0; k < n_ctx; ++k) {
-                mask_data[(size_t)q * (size_t)n_ctx + k] =
-                    (k <= q_pos) ? 0.0f : -std::numeric_limits<float>::infinity();
-            }
-        }
-        ggml_backend_tensor_set(kq_mask, mask_data.data(), 0,
-                                sizeof(float) * mask_data.size());
-    }
+    if (kq_mask_out) *kq_mask_out = kq_mask;
 
     // ── Transformer layers ────────────────────────────────────────────────────
     for (uint32_t il = 0; il < hp_.n_layer; ++il) {
@@ -697,7 +690,8 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             }
 
             ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
-            ggml_tensor * logits_t = build_graph(ctx, gf, e);
+            ggml_tensor * kq_mask = nullptr;
+            ggml_tensor * logits_t = build_graph(ctx, gf, e, &kq_mask);
             if (!logits_t) {
                 ggml_free(ctx);
                 out.sampled_tokens.push_back(-1);
@@ -706,14 +700,28 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
 
             // ── Allocate compute buffers ──────────────────────────────────────
             // ggml_gallocr_alloc_graph reuses existing buffers if large enough.
+            // After this call every tensor in gf (including kq_mask) has a buffer.
             if (!ggml_gallocr_alloc_graph(galloc_, gf)) {
-                // Buffer too small — galloc_ will resize internally on next call.
                 stats_.graph_alloc_resized++;
                 ggml_free(ctx);
                 out.sampled_tokens.push_back(-1);
                 goto next_entry;
             } else {
                 stats_.graph_alloc_reused++;
+            }
+
+            // ── Write causal mask (now kq_mask has a buffer) ──────────────────
+            if (kq_mask) {
+                std::vector<float> mask_data((size_t)n_ctx * (size_t)n_new);
+                for (int q = 0; q < n_new; ++q) {
+                    const int q_pos = e.num_computed + q;
+                    for (int k = 0; k < n_ctx; ++k) {
+                        mask_data[(size_t)q * (size_t)n_ctx + k] =
+                            (k <= q_pos) ? 0.0f : -std::numeric_limits<float>::infinity();
+                    }
+                }
+                ggml_backend_tensor_set(kq_mask, mask_data.data(), 0,
+                                        sizeof(float) * mask_data.size());
             }
 
             // ── Compute ───────────────────────────────────────────────────────
