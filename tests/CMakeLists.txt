@@ -398,3 +398,13 @@ target_include_directories(test_gc_chat PRIVATE
 )
 set_target_properties(test_gc_chat PROPERTIES CXX_STANDARD 17)
 add_test(NAME test_gc_chat COMMAND test_gc_chat)
+
+# Run manually:  test_gc_attention
+add_executable(test_gc_attention test_gc_attention.cpp)
+target_link_libraries(test_gc_attention PRIVATE gc_attention ggml)
+target_include_directories(test_gc_attention PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/attention
+    ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(test_gc_attention PROPERTIES CXX_STANDARD 17)
+add_test(NAME test_gc_attention COMMAND test_gc_attention)
