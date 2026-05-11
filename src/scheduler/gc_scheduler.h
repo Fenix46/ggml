@@ -37,6 +37,10 @@ struct gc_cached_req_entry_t {
     int                  num_computed_tokens = 0;
     int                  num_output_tokens   = 0;
     int                  num_prompt_tokens   = 0;
+    int32_t              last_token          = -1; // last generated token (decode step input)
+    // Full token sequence needed by runner to reconstruct context:
+    //   prompt_token_ids + output_token_ids up to this step.
+    std::vector<int32_t> all_token_ids;
 };
 
 struct gc_sched_output_t {

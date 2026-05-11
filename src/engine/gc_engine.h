@@ -18,6 +18,7 @@
 struct gc_batch_entry_t {
     std::string          req_id;
     std::vector<int32_t> token_ids;         // tokens to process this step
+    std::vector<int32_t> position_ids;      // absolute position for each token (for RoPE)
     std::vector<int32_t> block_ids;         // KV block ids for this request
     int                  num_computed       = 0;  // tokens already in KV cache
     int                  num_new_tokens     = 0;  // tokens in token_ids this step

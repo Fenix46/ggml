@@ -1,5 +1,6 @@
 #include "gc_server.h"
 #include "gc_engine.h"
+#include "gc_graph_runner.h"
 #include "gc_gguf_loader.h"
 #include "gc_hparams.h"
 #include "gc_vocab.h"
@@ -104,17 +105,29 @@ int main(int argc, char ** argv) {
         ep.sched.max_model_len = hp.n_ctx_train > 0 ? (int) hp.n_ctx_train : 4096;
         ep.sched.enable_prefix_cache = true;
 
-        gc_ggml_model_runner_t::config_t runner_cfg;
-        runner_cfg.num_layers = hp.n_layer > 0 ? (int) hp.n_layer : 1;
-        runner_cfg.vocab_size = std::max(2, (int) vocab.n_tokens());
-        runner_cfg.seed = 1;
-        runner_cfg.temperature = 0.8f;
-        runner_cfg.top_k = 40;
-        runner_cfg.top_p = 0.95f;
+        std::unique_ptr<gc_model_runner_t> runner_holder;
+
+        gc_graph_runner_t::config_t runner_cfg;
+        runner_cfg.num_kv_blocks      = num_blocks;
+        runner_cfg.kv_block_size      = block_size;
+        runner_cfg.seed               = 1;
+        runner_cfg.temperature        = 0.8f;
+        runner_cfg.top_k              = 40;
+        runner_cfg.top_p              = 0.95f;
         runner_cfg.repetition_penalty = 1.1f;
-        runner_cfg.repetition_window = 64;
-        gc_ggml_model_runner_t runner(runner_cfg);
-        gc_engine_t engine(ep, &runner);
+        runner_cfg.repetition_window  = 64;
+        auto graph_runner = std::make_unique<gc_graph_runner_t>(&loader, hp, runner_cfg);
+        if (!graph_runner->ok()) {
+            std::fprintf(stderr, "warning: graph runner init failed (%s) — using synthetic runner\n",
+                         graph_runner->error().c_str());
+            gc_ggml_model_runner_t::config_t synth_cfg;
+            synth_cfg.num_layers = hp.n_layer > 0 ? (int)hp.n_layer : 1;
+            synth_cfg.vocab_size = std::max(2, (int)vocab.n_tokens());
+            runner_holder = std::make_unique<gc_ggml_model_runner_t>(synth_cfg);
+        } else {
+            runner_holder = std::move(graph_runner);
+        }
+        gc_engine_t engine(ep, runner_holder.get());
 
         const int32_t eos_id = vocab.token_eos() == GC_TOKEN_NULL ? 2 : vocab.token_eos();
         gc_engine_server_runtime_t runtime(&engine, [&vocab](const std::string & text) {

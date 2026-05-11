@@ -93,3 +93,103 @@ bool gc_arch_runtime_build_rope_params(
             return gc__unsupported_arch(hp.arch, err_msg);
     }
 }
+
+// ── Norm parameters ───────────────────────────────────────────────────────────
+
+bool gc_arch_runtime_build_norm_params(
+        const gc_hparams_t & hp,
+        gc_norm_params_t   & out,
+        std::string        * err_msg) {
+    (void)err_msg;
+    out = {};
+    switch (hp.arch) {
+        // GPT-2 style: LayerNorm
+        case GC_ARCH_GPT2:
+        case GC_ARCH_GPTJ:
+        case GC_ARCH_GPTNEOX:
+        case GC_ARCH_MPT:
+        case GC_ARCH_BLOOM:
+            out.type = GC_NORM_LAYER;
+            out.eps  = hp.f_norm_eps > 0.0f ? hp.f_norm_eps : 1e-5f;
+            break;
+        // All RMSNorm architectures (default)
+        default:
+            out.type = GC_NORM_RMS;
+            out.eps  = hp.f_norm_rms_eps > 0.0f ? hp.f_norm_rms_eps : 1e-5f;
+            break;
+    }
+    return true;
+}
+
+// ── FFN parameters ────────────────────────────────────────────────────────────
+
+bool gc_arch_runtime_build_ffn_params(
+        const gc_hparams_t & hp,
+        gc_ffn_params_t    & out,
+        std::string        * err_msg) {
+    (void)err_msg;
+    out = {};
+    switch (hp.arch) {
+        // GELU, no gate (GPT-2 family)
+        case GC_ARCH_GPT2:
+        case GC_ARCH_GPTJ:
+        case GC_ARCH_STARCODER:
+        case GC_ARCH_STARCODER2:
+        case GC_ARCH_BLOOM:
+            out.act       = GC_FFN_GELU;
+            out.has_gate  = false;
+            out.gate_mode = GC_FFN_SEQ;
+            break;
+        // GELU with gate (Gemma family)
+        case GC_ARCH_GEMMA:
+        case GC_ARCH_GEMMA2:
+        case GC_ARCH_GEMMA3:
+        case GC_ARCH_GEMMA3N:
+        case GC_ARCH_GEMMA4:
+        case GC_ARCH_GEMMA_EMBEDDING:
+            out.act       = GC_FFN_GELU;
+            out.has_gate  = true;
+            out.gate_mode = GC_FFN_PAR;
+            break;
+        // SwiGLU (everything else: Llama, Qwen, Mistral, Falcon, etc.)
+        default:
+            out.act       = GC_FFN_SILU;
+            out.has_gate  = true;
+            out.gate_mode = GC_FFN_PAR;
+            break;
+    }
+    return true;
+}
+
+// ── Per-layer structural flags ────────────────────────────────────────────────
+
+bool gc_arch_runtime_build_layer_flags(
+        const gc_hparams_t & hp,
+        uint32_t             layer,
+        gc_layer_flags_t   & out,
+        std::string        * err_msg) {
+    (void)layer; (void)err_msg;
+    out = {};
+    out.causal    = hp.causal_attn;
+    out.apply_rope = true;
+
+    switch (hp.arch) {
+        case GC_ARCH_GEMMA2:
+        case GC_ARCH_GEMMA3:
+        case GC_ARCH_GEMMA3N:
+        case GC_ARCH_GEMMA4:
+            out.has_post_attn_norm = true;
+            out.has_post_ffn_norm  = true;
+            // Gemma3+ adds per-head Q/K norms
+            out.has_attn_q_norm = (hp.arch == GC_ARCH_GEMMA3  ||
+                                   hp.arch == GC_ARCH_GEMMA3N ||
+                                   hp.arch == GC_ARCH_GEMMA4);
+            out.has_attn_k_norm = out.has_attn_q_norm;
+            break;
+        // GPT-NeoX / Falcon: no RoPE on some variants — conservative: keep apply_rope=true,
+        // rope dispatcher will return n_dims=0 if not applicable.
+        default:
+            break;
+    }
+    return true;
+}

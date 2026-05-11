@@ -138,6 +138,20 @@ gc_cached_req_entry_t gc_scheduler_t::make_cached_entry(
     e.num_computed_tokens = req->num_computed_tokens;
     e.num_output_tokens   = req->num_output_tokens();
     e.num_prompt_tokens   = req->num_prompt_tokens();
+
+    // last_token: most recently generated token, or last prompt token if no output yet
+    if (!req->output_token_ids.empty()) {
+        e.last_token = req->output_token_ids.back();
+    } else if (!req->prompt_token_ids.empty()) {
+        e.last_token = req->prompt_token_ids.back();
+    }
+
+    // all_token_ids: full sequence = prompt + output so far
+    e.all_token_ids.reserve(req->prompt_token_ids.size() + req->output_token_ids.size());
+    e.all_token_ids.insert(e.all_token_ids.end(),
+                           req->prompt_token_ids.begin(), req->prompt_token_ids.end());
+    e.all_token_ids.insert(e.all_token_ids.end(),
+                           req->output_token_ids.begin(), req->output_token_ids.end());
     return e;
 }
 

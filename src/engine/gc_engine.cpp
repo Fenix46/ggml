@@ -47,6 +47,12 @@ gc_batch_t gc_engine_t::build_batch(const gc_sched_output_t & sched_out) const {
             nr.prompt_token_ids.begin() + start,
             nr.prompt_token_ids.begin() + end);
 
+        // Position ids: absolute positions for each token in this chunk
+        e.position_ids.resize(e.token_ids.size());
+        for (int i = 0; i < (int)e.token_ids.size(); ++i) {
+            e.position_ids[i] = nr.num_computed_tokens + i;
+        }
+
         batch.total_tokens += n;
         batch.entries.push_back(std::move(e));
     }
@@ -62,14 +68,24 @@ gc_batch_t gc_engine_t::build_batch(const gc_sched_output_t & sched_out) const {
         e.block_ids      = cr.new_block_ids;
         e.num_computed   = cr.num_computed_tokens;
         e.num_new_tokens = n;
-        // is_prefill = true if still processing prompt tokens (not all computed yet)
         e.is_prefill     = (cr.num_computed_tokens < cr.num_prompt_tokens);
 
-        // For decode steps token_ids is the single last token;
-        // for prefill continuation it's the next chunk.
-        // Phase 10 (arch) will build the actual token tensor here;
-        // for now we leave token_ids empty and let the mock fill it.
-        e.token_ids.resize(n, 0);
+        if (e.is_prefill) {
+            // Prefill continuation: next chunk of prompt tokens
+            int start = cr.num_computed_tokens;
+            int end   = std::min(start + n, (int)cr.all_token_ids.size());
+            e.token_ids.assign(cr.all_token_ids.begin() + start,
+                               cr.all_token_ids.begin() + end);
+        } else {
+            // Decode step: single token (last generated)
+            e.token_ids = { cr.last_token };
+        }
+
+        // Position ids: absolute positions for each token in this chunk
+        e.position_ids.resize(e.token_ids.size());
+        for (int i = 0; i < (int)e.token_ids.size(); ++i) {
+            e.position_ids[i] = cr.num_computed_tokens + i;
+        }
 
         batch.total_tokens += n;
         batch.entries.push_back(std::move(e));
