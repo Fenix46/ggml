@@ -427,3 +427,14 @@ target_include_directories(test_gc_scheduler PRIVATE
 )
 set_target_properties(test_gc_scheduler PROPERTIES CXX_STANDARD 17)
 add_test(NAME test_gc_scheduler COMMAND test_gc_scheduler)
+
+# Run manually:  test_gc_engine
+add_executable(test_gc_engine test_gc_engine.cpp)
+target_link_libraries(test_gc_engine PRIVATE gc_engine)
+target_include_directories(test_gc_engine PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/engine
+    ${CMAKE_SOURCE_DIR}/src/scheduler
+    ${CMAKE_SOURCE_DIR}/src/kvcache
+)
+set_target_properties(test_gc_engine PROPERTIES CXX_STANDARD 17)
+add_test(NAME test_gc_engine COMMAND test_gc_engine)

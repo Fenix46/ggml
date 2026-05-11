@@ -36,6 +36,7 @@ struct gc_cached_req_entry_t {
     std::vector<int32_t> new_block_ids;     // blocks newly allocated this step
     int                  num_computed_tokens = 0;
     int                  num_output_tokens   = 0;
+    int                  num_prompt_tokens   = 0;
 };
 
 struct gc_sched_output_t {
@@ -111,6 +112,11 @@ public:
     float kv_usage()    const { return kv_mgr_.usage(); }
 
     const gc_scheduler_params_t & params() const { return params_; }
+
+    // Proxy: used by gc_engine_t to expose KV block info per request.
+    const gc_req_blocks_t * kv_mgr_proxy(const std::string & req_id) const {
+        return kv_mgr_.get_blocks(req_id);
+    }
 
 private:
     gc_scheduler_params_t params_;

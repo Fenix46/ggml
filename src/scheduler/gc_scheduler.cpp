@@ -137,6 +137,7 @@ gc_cached_req_entry_t gc_scheduler_t::make_cached_entry(
     e.new_block_ids       = new_block_ids;
     e.num_computed_tokens = req->num_computed_tokens;
     e.num_output_tokens   = req->num_output_tokens();
+    e.num_prompt_tokens   = req->num_prompt_tokens();
     return e;
 }
 
