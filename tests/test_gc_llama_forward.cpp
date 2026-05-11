@@ -3,7 +3,7 @@
 // Manual validation lane for the real GGML Llama forward path.
 // Usage:
 //   test_gc_llama_forward <model.gguf> [--prompt TEXT] [--chat]
-//       [--expect-token ID] [--check-chunking]
+//       [--max-tokens N] [--expect-token ID] [--check-chunking]
 //       [--save-logits PATH] [--compare-logits PATH]
 //
 // This is intentionally CPU-only and single-request. It exists to validate
@@ -38,6 +38,8 @@ static int g_fail = 0;
 struct run_result_t {
     int32_t token = -1;
     std::string piece;
+    std::vector<int32_t> tokens;
+    std::string text;
     std::vector<float> logits;
 };
 
@@ -142,6 +144,7 @@ static run_result_t run_once(
         const gc_hparams_t & hp,
         const gc_vocab_t & vocab,
         const std::vector<int32_t> & prompt_tokens,
+        int max_tokens,
         int max_num_tokens,
         int max_prefill_chunk_tokens) {
     gc_graph_runner_t::config_t rcfg;
@@ -174,7 +177,7 @@ static run_result_t run_once(
     gc_engine_t eng(ep, &runner);
 
     gc_sampling_params_t sp;
-    sp.max_tokens = 1;
+    sp.max_tokens = max_tokens;
     sp.eos_token_id = vocab.token_eos() == GC_TOKEN_NULL ? -1 : vocab.token_eos();
     sp.ignore_eos = false;
     sp.temperature = 0.0f;
@@ -190,13 +193,19 @@ static run_result_t run_once(
         const gc_step_output_t out = eng.step();
         for (const gc_req_output_t & o : out.outputs) {
             if (o.req_id == "forward" && o.token >= 0) {
-                result.token = o.token;
-                result.piece = vocab.detokenize({o.token}, false);
+                const std::string piece = vocab.detokenize({o.token}, false);
+                if (result.tokens.empty()) {
+                    result.token = o.token;
+                    result.piece = piece;
+                }
+                result.tokens.push_back(o.token);
+                result.text += piece;
             }
         }
     }
     CHECK(guard > 0);
     CHECK(result.token >= 0);
+    CHECK(!result.tokens.empty());
     result.logits = runner.debug_last_logits();
     CHECK(!result.logits.empty());
     return result;
@@ -204,7 +213,7 @@ static run_result_t run_once(
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <model.gguf> [--prompt TEXT] [--chat] [--expect-token ID] [--check-chunking] [--save-logits PATH] [--compare-logits PATH]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model.gguf> [--prompt TEXT] [--chat] [--max-tokens N] [--expect-token ID] [--check-chunking] [--save-logits PATH] [--compare-logits PATH]\n", argv[0]);
         return 1;
     }
 
@@ -212,6 +221,7 @@ int main(int argc, char ** argv) {
     std::string prompt = "Hello";
     bool chat = false;
     bool check_chunking = false;
+    int max_tokens = 1;
     int32_t expect_token = -1;
     std::string save_logits_path;
     std::string compare_logits_path;
@@ -226,6 +236,10 @@ int main(int argc, char ** argv) {
             prompt = argv[++i];
         } else if (arg_starts(arg, "--prompt=")) {
             prompt = arg.substr(std::string("--prompt=").size());
+        } else if (arg == "--max-tokens" && i + 1 < argc) {
+            max_tokens = std::atoi(argv[++i]);
+        } else if (arg_starts(arg, "--max-tokens=")) {
+            max_tokens = std::atoi(arg.substr(std::string("--max-tokens=").size()).c_str());
         } else if (arg == "--expect-token" && i + 1 < argc) {
             expect_token = (int32_t)std::atoi(argv[++i]);
         } else if (arg_starts(arg, "--expect-token=")) {
@@ -242,6 +256,10 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
             return 1;
         }
+    }
+    if (max_tokens < 1) {
+        std::fprintf(stderr, "--max-tokens must be >= 1\n");
+        return 1;
     }
 
     try {
@@ -272,9 +290,13 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "\n");
 
         const run_result_t full = run_once(loader, hp, vocab, prompt_tokens,
+                                          max_tokens,
                                           /*max_num_tokens=*/std::max(64, (int)prompt_tokens.size()),
                                           /*max_prefill_chunk_tokens=*/std::max(64, (int)prompt_tokens.size()));
         std::fprintf(stderr, "INFO first_token=%d piece='%s'\n", full.token, full.piece.c_str());
+        std::fprintf(stderr, "INFO generated_tokens=%zu", full.tokens.size());
+        for (int32_t t : full.tokens) std::fprintf(stderr, " %d", t);
+        std::fprintf(stderr, "\nINFO generated_text=%s\n", full.text.c_str());
 
         if (expect_token >= 0) {
             CHECK(full.token == expect_token);
@@ -286,6 +308,7 @@ int main(int argc, char ** argv) {
         }
 
         if (!compare_logits_path.empty()) {
+            CHECK(max_tokens == 1);
             std::vector<float> ref;
             CHECK(read_logits_bin(compare_logits_path, ref));
             compare_logits(full.logits, ref);
@@ -293,10 +316,12 @@ int main(int argc, char ** argv) {
 
         if (check_chunking) {
             const run_result_t chunked = run_once(loader, hp, vocab, prompt_tokens,
+                                                 max_tokens,
                                                  /*max_num_tokens=*/1,
                                                  /*max_prefill_chunk_tokens=*/1);
             std::fprintf(stderr, "INFO chunked_first_token=%d piece='%s'\n", chunked.token, chunked.piece.c_str());
             CHECK(chunked.token == full.token);
+            CHECK(chunked.tokens == full.tokens);
         }
     } catch (const std::exception & e) {
         std::fprintf(stderr, "EXCEPTION: %s\n", e.what());
