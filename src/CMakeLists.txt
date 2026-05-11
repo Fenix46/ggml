@@ -501,6 +501,7 @@ add_subdirectory(attention)
 add_subdirectory(kvcache)
 add_subdirectory(scheduler)
 add_subdirectory(engine)
+add_subdirectory(server)
 
 # ── GGUF.CORE public aggregate target ────────────────────────────────────────
 add_library(gc_core INTERFACE)
@@ -516,4 +517,5 @@ target_link_libraries(gc_core INTERFACE
     gc_kvcache
     gc_scheduler
     gc_engine
+    gc_server
 )

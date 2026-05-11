@@ -438,3 +438,12 @@ target_include_directories(test_gc_engine PRIVATE
 )
 set_target_properties(test_gc_engine PROPERTIES CXX_STANDARD 17)
 add_test(NAME test_gc_engine COMMAND test_gc_engine)
+
+# Run manually:  test_gc_server
+add_executable(test_gc_server test_gc_server.cpp)
+target_link_libraries(test_gc_server PRIVATE gc_server)
+target_include_directories(test_gc_server PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/server
+)
+set_target_properties(test_gc_server PROPERTIES CXX_STANDARD 17)
+add_test(NAME test_gc_server COMMAND test_gc_server)

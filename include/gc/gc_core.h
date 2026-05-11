@@ -8,4 +8,4 @@
 #include "gc_kvcache.h"
 #include "gc_scheduler.h"
 #include "gc_engine.h"
-
+#include "gc_server.h"
