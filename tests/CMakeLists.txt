@@ -408,3 +408,12 @@ target_include_directories(test_gc_attention PRIVATE
 )
 set_target_properties(test_gc_attention PROPERTIES CXX_STANDARD 17)
 add_test(NAME test_gc_attention COMMAND test_gc_attention)
+
+# Run manually:  test_gc_kvcache
+add_executable(test_gc_kvcache test_gc_kvcache.cpp)
+target_link_libraries(test_gc_kvcache PRIVATE gc_kvcache)
+target_include_directories(test_gc_kvcache PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/kvcache
+)
+set_target_properties(test_gc_kvcache PROPERTIES CXX_STANDARD 17)
+add_test(NAME test_gc_kvcache COMMAND test_gc_kvcache)
