@@ -675,10 +675,19 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             }
 
             // ── Build graph ───────────────────────────────────────────────────
-            // Graph context: no_alloc=true, all allocations via galloc_.
-            // Budget: ~128 nodes per layer + overhead.
-            const size_t max_nodes = (size_t)hp_.n_layer * 256 + 128
-                                   + (size_t)n_ctx * (size_t)hp_.n_layer * 4; // KV gather nodes
+            // Context pool holds every tensor object allocated during graph build
+            // (intermediates, views, copies — not just graph leaf nodes).
+            //
+            // Per-layer tensor budget breakdown:
+            //   ~50 fixed tensors (norm/proj/rope/attn/ffn intermediates)
+            //   n_new * 4  KV write nodes (2 view + 2 cpy per token, K+V)
+            //   n_ctx * 4  KV gather nodes (2 view + 2 cpy per token, K+V)
+            //   2          K_full / V_full output tensors
+            // Plus 64 global tensors (inputs, lm_head, output norm, mask).
+            const size_t tensors_per_layer = 64
+                                           + (size_t)n_new * 4
+                                           + (size_t)n_ctx * 4;
+            const size_t max_nodes = (size_t)hp_.n_layer * tensors_per_layer + 128;
             const size_t ctx_size  = ggml_tensor_overhead() * max_nodes
                                    + ggml_graph_overhead_custom(max_nodes, false);
             ggml_init_params ip{ ctx_size, nullptr, true };
