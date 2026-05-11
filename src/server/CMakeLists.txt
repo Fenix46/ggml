@@ -12,7 +12,24 @@ target_include_directories(gc_server PUBLIC
 
 target_link_libraries(gc_server PUBLIC gc_engine)
 
+add_executable(gc_server_main
+    gc_server_main.cpp
+)
+
+target_link_libraries(gc_server_main PUBLIC
+    gc_server
+    gc_engine
+    gc_loader
+    gc_arch
+    gc_vocab
+)
+
 set_target_properties(gc_server PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(gc_server_main PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
 )
