@@ -1,6 +1,12 @@
 #include "gc_arch_runtime.h"
 
 #include "gc_arch.h"
+#include "gc_arch_gemma.h"
+#include "gc_arch_gemma2.h"
+#include "gc_arch_gemma3.h"
+#include "gc_arch_gemma3n.h"
+#include "gc_arch_gemma4.h"
+#include "gc_arch_gemma_embedding.h"
 #include "gc_arch_llama.h"
 
 #include <cstdio>
@@ -19,6 +25,18 @@ bool gc_arch_runtime_validate_hparams(const gc_hparams_t & hp, std::string * err
         case GC_ARCH_LLAMA:
         case GC_ARCH_LLAMA_EMBED:
             return gc_arch_llama_validate_hparams(hp, err_msg);
+        case GC_ARCH_GEMMA:
+            return gc_arch_gemma_validate_hparams(hp, err_msg);
+        case GC_ARCH_GEMMA2:
+            return gc_arch_gemma2_validate_hparams(hp, err_msg);
+        case GC_ARCH_GEMMA3:
+            return gc_arch_gemma3_validate_hparams(hp, err_msg);
+        case GC_ARCH_GEMMA3N:
+            return gc_arch_gemma3n_validate_hparams(hp, err_msg);
+        case GC_ARCH_GEMMA4:
+            return gc_arch_gemma4_validate_hparams(hp, err_msg);
+        case GC_ARCH_GEMMA_EMBEDDING:
+            return gc_arch_gemma_embedding_validate_hparams(hp, err_msg);
         default:
             return gc__unsupported_arch(hp.arch, err_msg);
     }
@@ -34,6 +52,18 @@ bool gc_arch_runtime_build_attn_params(
         case GC_ARCH_LLAMA:
         case GC_ARCH_LLAMA_EMBED:
             return gc_arch_llama_build_attn_params(hp, layer, n_tokens, out, err_msg);
+        case GC_ARCH_GEMMA:
+            return gc_arch_gemma_build_attn_params(hp, layer, n_tokens, out, err_msg);
+        case GC_ARCH_GEMMA2:
+            return gc_arch_gemma2_build_attn_params(hp, layer, n_tokens, out, err_msg);
+        case GC_ARCH_GEMMA3:
+            return gc_arch_gemma3_build_attn_params(hp, layer, n_tokens, out, err_msg);
+        case GC_ARCH_GEMMA3N:
+            return gc_arch_gemma3n_build_attn_params(hp, layer, n_tokens, out, err_msg);
+        case GC_ARCH_GEMMA4:
+            return gc_arch_gemma4_build_attn_params(hp, layer, n_tokens, out, err_msg);
+        case GC_ARCH_GEMMA_EMBEDDING:
+            return gc_arch_gemma_embedding_build_attn_params(hp, layer, n_tokens, out, err_msg);
         default:
             return gc__unsupported_arch(hp.arch, err_msg);
     }
@@ -47,6 +77,18 @@ bool gc_arch_runtime_build_rope_params(
         case GC_ARCH_LLAMA:
         case GC_ARCH_LLAMA_EMBED:
             return gc_arch_llama_build_rope_params(hp, out, err_msg);
+        case GC_ARCH_GEMMA:
+            return gc_arch_gemma_build_rope_params(hp, out, err_msg);
+        case GC_ARCH_GEMMA2:
+            return gc_arch_gemma2_build_rope_params(hp, out, err_msg);
+        case GC_ARCH_GEMMA3:
+            return gc_arch_gemma3_build_rope_params(hp, out, err_msg);
+        case GC_ARCH_GEMMA3N:
+            return gc_arch_gemma3n_build_rope_params(hp, out, err_msg);
+        case GC_ARCH_GEMMA4:
+            return gc_arch_gemma4_build_rope_params(hp, out, err_msg);
+        case GC_ARCH_GEMMA_EMBEDDING:
+            return gc_arch_gemma_embedding_build_rope_params(hp, out, err_msg);
         default:
             return gc__unsupported_arch(hp.arch, err_msg);
     }

@@ -3,6 +3,13 @@ add_library(gc_arch STATIC
     gc_hparams.cpp
     gc_arch_llama.cpp
     gc_arch_runtime.cpp
+    gc_arch_gemma_common.cpp
+    gc_arch_gemma.cpp
+    gc_arch_gemma2.cpp
+    gc_arch_gemma3.cpp
+    gc_arch_gemma3n.cpp
+    gc_arch_gemma4.cpp
+    gc_arch_gemma_embedding.cpp
 )
 
 target_include_directories(gc_arch PUBLIC

@@ -152,21 +152,56 @@ static void test_llama_arch_adapter() {
     CHECK(fabsf(ap.kq_scale - 0.5f) < 1e-6f, "attn params explicit kq scale");
 }
 
-static void test_runtime_dispatch_unsupported() {
+static void test_runtime_dispatch_gemma_variants() {
     gc_hparams_t hp;
     hp.arch = GC_ARCH_GEMMA2;
     hp.n_embd = 2304;
-    hp.n_layer = 26;
+    hp.n_layer = 46;
     hp.n_head = 8;
     hp.n_head_kv = 4;
+    hp.n_ctx_train = 8192;
+    hp.causal_attn = true;
 
     gc_attn_params_t ap;
     gc_rope_params_t rp;
     std::string err;
 
-    CHECK(!gc_arch_runtime_validate_hparams(hp, &err), "runtime rejects unsupported arch until implemented");
-    CHECK(!gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime rejects unsupported attn build");
-    CHECK(!gc_arch_runtime_build_rope_params(hp, rp, &err), "runtime rejects unsupported rope build");
+    CHECK(gc_arch_runtime_validate_hparams(hp, &err), "runtime supports gemma2 validate");
+    CHECK(gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime supports gemma2 attn build");
+    CHECK(gc_arch_runtime_build_rope_params(hp, rp, &err), "runtime supports gemma2 rope build");
+    CHECK(fabsf(ap.kq_scale - (1.0f / sqrtf(288.0f))) < 1e-6f, "gemma2 27b rule attention scale");
+
+    hp.arch = GC_ARCH_GEMMA3N;
+    hp.n_layer = 35;
+    CHECK(gc_arch_runtime_validate_hparams(hp, &err), "runtime supports gemma3n validate");
+    CHECK(gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime supports gemma3n attn build");
+    CHECK(fabsf(ap.kq_scale - 1.0f) < 1e-6f, "gemma3n fixed attention scale = 1.0");
+
+    hp.arch = GC_ARCH_GEMMA_EMBEDDING;
+    hp.causal_attn = false;
+    hp.n_layer = 24;
+    CHECK(gc_arch_runtime_validate_hparams(hp, &err), "runtime supports gemma embedding validate");
+    CHECK(gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime supports gemma embedding attn build");
+
+    hp.causal_attn = true;
+    CHECK(!gc_arch_runtime_validate_hparams(hp, &err), "gemma embedding rejects causal attention");
+}
+
+static void test_runtime_dispatch_still_unsupported() {
+    gc_hparams_t hp;
+    hp.arch = GC_ARCH_QWEN2;
+    hp.n_embd = 1536;
+    hp.n_layer = 28;
+    hp.n_head = 12;
+    hp.n_head_kv = 2;
+
+    gc_attn_params_t ap;
+    gc_rope_params_t rp;
+    std::string err;
+
+    CHECK(!gc_arch_runtime_validate_hparams(hp, &err), "runtime still rejects non-implemented arch");
+    CHECK(!gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime still rejects non-implemented attn");
+    CHECK(!gc_arch_runtime_build_rope_params(hp, rp, &err), "runtime still rejects non-implemented rope");
 }
 
 // ── Hparams from file (optional) ──────────────────────────────────────────────
@@ -183,15 +218,17 @@ static void test_hparams_from_file(const char * path) {
     CHECK(hp.n_layer > 0,            "n_layer > 0");
     CHECK(hp.n_head > 0,             "n_head > 0");
 
-    if (hp.arch == GC_ARCH_LLAMA || hp.arch == GC_ARCH_LLAMA_EMBED) {
+    if (hp.arch == GC_ARCH_LLAMA || hp.arch == GC_ARCH_LLAMA_EMBED ||
+        hp.arch == GC_ARCH_GEMMA || hp.arch == GC_ARCH_GEMMA2 || hp.arch == GC_ARCH_GEMMA3 ||
+        hp.arch == GC_ARCH_GEMMA3N || hp.arch == GC_ARCH_GEMMA4 || hp.arch == GC_ARCH_GEMMA_EMBEDDING) {
         std::string err;
         gc_attn_params_t ap;
         gc_rope_params_t rp;
-        CHECK(gc_arch_runtime_validate_hparams(hp, &err), "runtime llama file hparams valid");
-        CHECK(gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime llama file attn params build");
-        CHECK(gc_arch_runtime_build_rope_params(hp, rp, &err), "runtime llama file rope params build");
-        CHECK(ap.n_embd_head_q > 0, "llama file attn head dim > 0");
-        CHECK(rp.n_dims > 0, "llama file rope dims > 0");
+        CHECK(gc_arch_runtime_validate_hparams(hp, &err), "runtime arch file hparams valid");
+        CHECK(gc_arch_runtime_build_attn_params(hp, 0, 16, ap, &err), "runtime arch file attn params build");
+        CHECK(gc_arch_runtime_build_rope_params(hp, rp, &err), "runtime arch file rope params build");
+        CHECK(ap.n_embd_head_q > 0, "arch file attn head dim > 0");
+        CHECK(rp.n_dims > 0, "arch file rope dims > 0");
     }
 
     fprintf(stdout,
@@ -213,7 +250,8 @@ int main(int argc, char ** argv) {
     test_tensor_names();
     test_tensor_info();
     test_llama_arch_adapter();
-    test_runtime_dispatch_unsupported();
+    test_runtime_dispatch_gemma_variants();
+    test_runtime_dispatch_still_unsupported();
 
     if (argc >= 2) {
         fprintf(stdout, "\n[hparams from file: %s]\n", argv[1]);
