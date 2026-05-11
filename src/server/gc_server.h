@@ -3,10 +3,13 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <functional>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+class gc_engine_t;
 
 struct gc_server_request_t {
     std::string              id;
@@ -28,6 +31,24 @@ public:
     virtual std::string submit(const gc_server_request_t & req) = 0;
     virtual bool cancel(const std::string & req_id) = 0;
     virtual std::vector<gc_server_token_event_t> step() = 0;
+};
+
+using gc_server_tokenize_fn_t = std::function<std::vector<int32_t>(const std::string &)>;
+
+class gc_engine_server_runtime_t final : public gc_server_runtime_t {
+public:
+    gc_engine_server_runtime_t(
+        gc_engine_t * engine,
+        gc_server_tokenize_fn_t tokenize_fn);
+
+    std::string submit(const gc_server_request_t & req) override;
+    bool cancel(const std::string & req_id) override;
+    std::vector<gc_server_token_event_t> step() override;
+
+private:
+    gc_engine_t * engine_ = nullptr; // non-owning
+    gc_server_tokenize_fn_t tokenize_fn_;
+    std::mutex mu_;
 };
 
 struct gc_server_params_t {

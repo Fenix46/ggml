@@ -1,4 +1,5 @@
 #include "gc_server.h"
+#include "gc_engine.h"
 
 #include "vendor/httplib.h"
 #include "vendor/json.hpp"
@@ -81,6 +82,54 @@ private:
 };
 
 } // namespace
+
+gc_engine_server_runtime_t::gc_engine_server_runtime_t(
+        gc_engine_t * engine,
+        gc_server_tokenize_fn_t tokenize_fn)
+    : engine_(engine), tokenize_fn_(std::move(tokenize_fn)) {}
+
+std::string gc_engine_server_runtime_t::submit(const gc_server_request_t & req) {
+    std::lock_guard<std::mutex> lg(mu_);
+    if (!engine_) return "";
+
+    auto toks = tokenize_fn_ ? tokenize_fn_(req.prompt_text) : std::vector<int32_t>{};
+    if (toks.empty()) {
+        // Keep request valid even with an empty prompt.
+        toks.push_back(1);
+    }
+
+    gc_sampling_params_t sp;
+    sp.max_tokens = req.max_tokens > 0 ? req.max_tokens : 16;
+    sp.eos_token_id = 2;
+    sp.ignore_eos = false;
+
+    engine_->add_request(std::make_unique<gc_request_t>(req.id, toks, sp));
+    return req.id;
+}
+
+bool gc_engine_server_runtime_t::cancel(const std::string & req_id) {
+    std::lock_guard<std::mutex> lg(mu_);
+    if (!engine_) return false;
+    engine_->abort_request(req_id);
+    return true;
+}
+
+std::vector<gc_server_token_event_t> gc_engine_server_runtime_t::step() {
+    std::lock_guard<std::mutex> lg(mu_);
+    std::vector<gc_server_token_event_t> out;
+    if (!engine_ || !engine_->has_work()) return out;
+
+    const gc_step_output_t s = engine_->step();
+    out.reserve(s.outputs.size());
+    for (const auto & o : s.outputs) {
+        gc_server_token_event_t ev;
+        ev.req_id = o.req_id;
+        ev.token = o.token;
+        ev.finished = o.finished;
+        out.push_back(ev);
+    }
+    return out;
+}
 
 struct gc_server_t::impl_t {
     httplib::Server http;
@@ -239,4 +288,3 @@ void gc_server_t::stop() {
     }
     running_.store(false);
 }
-
