@@ -365,3 +365,15 @@ target_include_directories(test_gc_loader PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 set_target_properties(test_gc_loader PROPERTIES CXX_STANDARD 17)
+
+# Run manually:  test_gc_arch [model.gguf]
+# Without a model path it exercises the unit tests only (no file needed)
+add_executable(test_gc_arch test_gc_arch.cpp)
+target_link_libraries(test_gc_arch PRIVATE gc_arch gc_loader ggml)
+target_include_directories(test_gc_arch PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/arch
+    ${CMAKE_SOURCE_DIR}/src/loader
+    ${CMAKE_SOURCE_DIR}/include
+)
+set_target_properties(test_gc_arch PROPERTIES CXX_STANDARD 17)
+add_test(NAME test_gc_arch COMMAND test_gc_arch)
