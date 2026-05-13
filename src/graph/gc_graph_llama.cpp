@@ -1,8 +1,8 @@
 #include "gc_graph_llama.h"
-#include "gc_graph_runner.h"    // gc_kv_pool_t
-#include "gc_attention.h"       // gc_build_norm, gc_build_ffn, gc_build_attn_mha
-#include "gc_arch_runtime.h"    // gc_arch_runtime_build_attn_params, etc.
-#include "gc_rope.h"            // gc_rope_apply
+#include "gc_graph_runner.h"
+#include "gc_attention.h"
+#include "gc_arch_runtime.h"
+#include "gc_rope.h"
 
 #include <string>
 
@@ -64,7 +64,7 @@ ggml_tensor * GcGraphLlama::build(const GcGraphBuildParams & p) {
         ggml_tensor * Vcur = ggml_reshape_3d(p.ctx,
             ggml_mul_mat(p.ctx, w_v, normed_attn), n_embd_hv, nkv, (int64_t)n_new);
 
-        // RoPE parameters from arch runtime (no layer-specific override)
+        // RoPE
         gc_rope_params_t rp{};
         if (!gc_arch_runtime_build_rope_params(*p.hp, rp, &lerr))
             return nullptr;
@@ -153,7 +153,7 @@ ggml_tensor * GcGraphLlama::build(const GcGraphBuildParams & p) {
             V3 = ggml_reshape_3d(p.ctx, V_full, n_embd_hv, nkv, (int64_t)n_ctx);
         }
 
-        // MHA — n_tokens is the number of QUERY tokens (n_new), not total context
+        // MHA
         gc_attn_params_t ap_mha = ap;
         ap_mha.n_tokens = (int64_t)n_new;
         auto cb = [](ggml_tensor *, const char *, int) {};
@@ -195,13 +195,17 @@ ggml_tensor * GcGraphLlama::build(const GcGraphBuildParams & p) {
         cur = ggml_add(p.ctx, cur, ffn_out);
     }
 
-    // Output norm + lm_head
+    // Output norm
     ggml_tensor * w_on = p.get_weight(p.ctx, GC_TENSOR_OUTPUT_NORM, "weight", -1);
     if (w_on)
         cur = gc_build_norm(p.ctx, cur, w_on, nullptr, norm_type, norm_eps,
                             [](ggml_tensor *, const char *, int) {}, -1);
 
+    // LM head — may be tied to token_embd.weight (shared embeddings)
     ggml_tensor * w_out = p.get_weight(p.ctx, GC_TENSOR_OUTPUT, "weight", -1);
+    if (!w_out) {
+        w_out = p.get_weight(p.ctx, GC_TENSOR_TOKEN_EMBD, "weight", -1);
+    }
     if (!w_out) return nullptr;
 
     ggml_tensor * logits = ggml_mul_mat(p.ctx, w_out, cur);

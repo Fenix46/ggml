@@ -527,7 +527,7 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
 
             ggml_free(ctx);
 
-            // Diagnostic: log top-5 logit tokens on first two steps.
+            // Diagnostic: log top-5 logit tokens on first 2 steps.
             if (stats_.steps_executed <= 2) {
                 std::vector<int> tidx((size_t)vocab);
                 std::iota(tidx.begin(), tidx.end(), 0);
