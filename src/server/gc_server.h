@@ -64,7 +64,8 @@ struct gc_server_params_t {
     int         port = 8080;
     gc_server_runtime_t * runtime = nullptr; // non-owning; optional
     gc_server_detokenize_fn_t detokenize_fn;
-    gc_chat_template_t chat_template = GC_CHAT_TEMPLATE_UNKNOWN;
+    gc_chat_template_t * chat_template = nullptr; // non-owning; compiled Jinja2 template
+    std::string        chat_template_str;         // raw template string for reference
 };
 
 class gc_server_t {

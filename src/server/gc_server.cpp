@@ -13,38 +13,37 @@ using json = nlohmann::json;
 
 namespace {
 
-static std::string gc__extract_prompt(const json & in, gc_chat_template_t tmpl) {
+static std::string gc__extract_prompt(const json & in, gc_chat_template_t * tmpl) {
     const auto & msgs = in["messages"];
 
-    // Build gc_chat_message_t list from JSON.
-    // We keep the string storage alive in parallel vectors.
-    std::vector<std::string> roles, contents;
-    roles.reserve(msgs.size());
-    contents.reserve(msgs.size());
+    std::vector<std::string> role_store, content_store;
+    role_store.reserve(msgs.size());
+    content_store.reserve(msgs.size());
     for (const auto & m : msgs) {
         if (!m.is_object()) continue;
-        roles.push_back(m.value("role", ""));
-        contents.push_back(m.value("content", ""));
+        role_store.push_back(m.value("role", ""));
+        content_store.push_back(m.value("content", ""));
     }
 
-    if (tmpl != GC_CHAT_TEMPLATE_UNKNOWN) {
-        std::vector<gc_chat_message_t>        msg_objs(roles.size());
-        std::vector<const gc_chat_message_t*> msg_ptrs(roles.size());
-        for (size_t i = 0; i < roles.size(); ++i) {
-            msg_objs[i] = { roles[i].c_str(), contents[i].c_str() };
-            msg_ptrs[i] = &msg_objs[i];
-        }
+    // Build parallel arrays
+    std::vector<const char*> role_ptrs, content_ptrs;
+    for (size_t i = 0; i < role_store.size(); i++) {
+        role_ptrs.push_back(role_store[i].c_str());
+        content_ptrs.push_back(content_store[i].c_str());
+    }
+
+    if (tmpl) {
         std::string out;
-        if (gc_chat_apply_template(tmpl, msg_ptrs, out, /*add_ass=*/true) > 0) {
-            return out;
-        }
+        gc_status_t st = gc_chat_render(tmpl, role_ptrs.data(), content_ptrs.data(),
+                                        role_ptrs.size(), "", true, &out);
+        if (st == GC_OK && !out.empty()) return out;
     }
 
     // Fallback: plain concatenation
     std::ostringstream oss;
-    for (size_t i = 0; i < roles.size(); ++i) {
-        if (!roles[i].empty() && !contents[i].empty()) {
-            oss << roles[i] << ": " << contents[i] << "\n";
+    for (size_t i = 0; i < role_store.size(); ++i) {
+        if (!role_store[i].empty() && !content_store[i].empty()) {
+            oss << role_store[i] << ": " << content_store[i] << "\n";
         }
     }
     return oss.str();

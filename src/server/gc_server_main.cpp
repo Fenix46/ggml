@@ -138,14 +138,23 @@ int main(int argc, char ** argv) {
             return toks;
         }, eos_id);
 
-        // Read chat template from GGUF metadata and detect template type.
-        gc_chat_template_t chat_tmpl = GC_CHAT_TEMPLATE_UNKNOWN;
+        // Read chat template from GGUF metadata and compile with Jinja2 engine.
+        gc_chat_template_t * chat_tmpl = nullptr;
+        std::string raw_tmpl;
         {
-            std::string raw_tmpl;
-            if (loader.get_str("tokenizer.chat_template", raw_tmpl, false) && !raw_tmpl.empty()) {
-                chat_tmpl = gc_chat_detect_template(raw_tmpl);
-                std::fprintf(stderr, "chat_template: detected %s\n",
-                             chat_tmpl == GC_CHAT_TEMPLATE_UNKNOWN ? "unknown (fallback)" : "known");
+            std::string raw;
+            if (loader.get_str("tokenizer.chat_template", raw, false) && !raw.empty()) {
+                raw_tmpl = raw;
+                gc_status_t st = gc_chat_create(&chat_tmpl);
+                if (st == GC_OK) {
+                    st = gc_chat_compile(chat_tmpl, raw.c_str());
+                    std::fprintf(stderr, "chat_template: compiled %s\n",
+                                 st == GC_OK ? "ok" : "failed");
+                    if (st != GC_OK) {
+                        gc_chat_free(chat_tmpl);
+                        chat_tmpl = nullptr;
+                    }
+                }
             }
         }
 
@@ -154,6 +163,7 @@ int main(int argc, char ** argv) {
         sp.port = port;
         sp.runtime = &runtime;
         sp.chat_template = chat_tmpl;
+        sp.chat_template_str = raw_tmpl;
         sp.detokenize_fn = [&vocab](int32_t tok) {
             std::string s = vocab.detokenize({tok}, false);
             if (s.empty()) {
@@ -180,6 +190,7 @@ int main(int argc, char ** argv) {
         }
 
         server.stop();
+        if (chat_tmpl) gc_chat_free(chat_tmpl);
         std::fprintf(stderr, "gc_server_main stopped\n");
         return 0;
     } catch (const std::exception & e) {
