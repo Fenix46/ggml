@@ -2,6 +2,18 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+
+namespace {
+static bool gc__trace_enabled() {
+    static int v = []() {
+        const char * e = std::getenv("GC_DEBUG_TRACE");
+        return (e && *e && std::string(e) != "0") ? 1 : 0;
+    }();
+    return v != 0;
+}
+}
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -110,6 +122,11 @@ gc_step_output_t gc_engine_t::process_output(
     // Build req_id → sampled_token map from model output (skip prefill-only entries).
     std::unordered_map<std::string, int32_t> new_tokens;
     for (size_t i = 0; i < model_out.req_ids.size(); ++i) {
+        if (gc__trace_enabled()) {
+            const int tok = (i < model_out.sampled_tokens.size()) ? model_out.sampled_tokens[i] : -999999;
+            std::fprintf(stderr, "[gc_trace][engine] model_out req=%s tok=%d\n",
+                         model_out.req_ids[i].c_str(), tok);
+        }
         if (i < model_out.sampled_tokens.size() && model_out.sampled_tokens[i] >= 0) {
             new_tokens[model_out.req_ids[i]] = model_out.sampled_tokens[i];
         }
@@ -170,7 +187,38 @@ gc_step_output_t gc_engine_t::step() {
     gc_sched_output_t sched_out = sched_.schedule();
     if (sched_out.empty()) return {};
 
+    if (gc__trace_enabled()) {
+        std::fprintf(stderr,
+            "[gc_trace][engine] schedule total=%d new=%zu cached=%zu finished=%zu\n",
+            sched_out.total_scheduled_tokens,
+            sched_out.new_reqs.size(),
+            sched_out.cached_reqs.size(),
+            sched_out.finished_req_ids.size());
+        for (const auto & nr : sched_out.new_reqs) {
+            const int n = sched_out.num_scheduled_tokens.count(nr.req_id) ? sched_out.num_scheduled_tokens.at(nr.req_id) : 0;
+            std::fprintf(stderr,
+                "[gc_trace][engine] new req=%s computed=%d prompt=%zu scheduled=%d blocks=%zu\n",
+                nr.req_id.c_str(), nr.num_computed_tokens, nr.prompt_token_ids.size(), n, nr.block_ids.size());
+        }
+        for (const auto & cr : sched_out.cached_reqs) {
+            const int n = sched_out.num_scheduled_tokens.count(cr.req_id) ? sched_out.num_scheduled_tokens.at(cr.req_id) : 0;
+            std::fprintf(stderr,
+                "[gc_trace][engine] cached req=%s computed=%d prompt=%d out=%d scheduled=%d last=%d blocks=%zu\n",
+                cr.req_id.c_str(), cr.num_computed_tokens, cr.num_prompt_tokens, cr.num_output_tokens, n, cr.last_token, cr.block_ids.size());
+        }
+    }
+
     gc_batch_t batch = build_batch(sched_out);
+    if (gc__trace_enabled()) {
+        std::fprintf(stderr, "[gc_trace][engine] batch entries=%zu total_tokens=%d\n",
+                     batch.entries.size(), batch.total_tokens);
+        for (const auto & e : batch.entries) {
+            std::fprintf(stderr,
+                "[gc_trace][engine] batch req=%s prefill=%d last_prefill=%d computed=%d n_new=%d tok_count=%zu\n",
+                e.req_id.c_str(), e.is_prefill ? 1 : 0, e.is_last_prefill ? 1 : 0,
+                e.num_computed, e.num_new_tokens, e.token_ids.size());
+        }
+    }
 
     gc_model_output_t model_out;
     if (!batch.empty()) {

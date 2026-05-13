@@ -11,10 +11,21 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <numeric>
+
+namespace {
+static bool gc__trace_enabled() {
+    static int v = []() {
+        const char * e = std::getenv("GC_DEBUG_TRACE");
+        return (e && *e && std::string(e) != "0") ? 1 : 0;
+    }();
+    return v != 0;
+}
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Compile-time assertion guard: no CPU-side KV reconstruction in hot path.
@@ -168,13 +179,18 @@ bool gc_graph_runner_t::init() {
     if (!backend_cpu_) { err_ = "CPU backend init failed"; return false; }
     ggml_backend_cpu_set_n_threads(backend_cpu_, cfg_.n_threads);
 
+    const bool force_cpu = []() {
+        const char * e = std::getenv("GC_FORCE_CPU");
+        return (e && *e && std::string(e) != "0");
+    }();
+
     // Try to find a GPU/accelerator backend first.
-    backend_ = ggml_backend_init_best();
+    backend_ = force_cpu ? nullptr : ggml_backend_init_best();
     if (!backend_) {
         // No accelerator: use CPU for everything.
         backend_     = backend_cpu_;
         backend_is_cpu_ = true;
-        fprintf(stderr, "[gc_graph_runner] No accelerator found, using CPU backend\n");
+        fprintf(stderr, "[gc_graph_runner] using CPU backend%s\n", force_cpu ? " (forced)" : "");
     } else {
         const ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
         const auto dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
@@ -381,31 +397,43 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
         ggml_tensor * w_v = weight_view(ctx, find_w(GC_TENSOR_ATTN_V, "weight", (int)il));
         if (!w_q || !w_k || !w_v) { err_ = "missing attn QKV weight"; return nullptr; }
 
-        const int64_t proj_q = w_q->ne[0];
-        const int64_t proj_k = w_k->ne[0];
-        const int64_t proj_v = w_v->ne[0];
+        ggml_tensor * Qlin = ggml_mul_mat(ctx, w_q, normed_attn);
+        ggml_tensor * Klin = ggml_mul_mat(ctx, w_k, normed_attn);
+        ggml_tensor * Vlin = ggml_mul_mat(ctx, w_v, normed_attn);
+
+        const int64_t proj_q = Qlin->ne[0];
+        const int64_t proj_k = Klin->ne[0];
+        const int64_t proj_v = Vlin->ne[0];
         if (nq <= 0 || nkv <= 0 || proj_q <= 0 || proj_k <= 0 || proj_v <= 0) {
             err_ = "invalid attention dimensions";
             return nullptr;
         }
         if ((proj_q % nq) != 0 || (proj_k % nkv) != 0 || (proj_v % nkv) != 0) {
-            err_ = "projection width is not divisible by head count at layer " + std::to_string(il);
+            err_ = "projection width/head mismatch at layer " + std::to_string(il) +
+                   " (proj_q=" + std::to_string(proj_q) +
+                   " proj_k=" + std::to_string(proj_k) +
+                   " proj_v=" + std::to_string(proj_v) +
+                   " nq=" + std::to_string(nq) +
+                   " nkv=" + std::to_string(nkv) + ")";
             return nullptr;
         }
         const int64_t n_embd_hq = proj_q / nq;
         const int64_t n_embd_hk = proj_k / nkv;
         const int64_t n_embd_hv = proj_v / nkv;
         if (n_embd_hq != n_embd_hk) {
-            err_ = "Q/K head dimension mismatch at layer " + std::to_string(il);
+            err_ = "Q/K head dimension mismatch at layer " + std::to_string(il) +
+                   " (proj_q=" + std::to_string(proj_q) +
+                   " proj_k=" + std::to_string(proj_k) +
+                   " nq=" + std::to_string(nq) +
+                   " nkv=" + std::to_string(nkv) +
+                   " hq=" + std::to_string(n_embd_hq) +
+                   " hk=" + std::to_string(n_embd_hk) + ")";
             return nullptr;
         }
 
-        ggml_tensor * Qcur = ggml_reshape_3d(ctx,
-            ggml_mul_mat(ctx, w_q, normed_attn), n_embd_hq, nq, (int64_t)n_new);
-        ggml_tensor * Kcur = ggml_reshape_3d(ctx,
-            ggml_mul_mat(ctx, w_k, normed_attn), n_embd_hq, nkv, (int64_t)n_new);
-        ggml_tensor * Vcur = ggml_reshape_3d(ctx,
-            ggml_mul_mat(ctx, w_v, normed_attn), n_embd_hv, nkv, (int64_t)n_new);
+        ggml_tensor * Qcur = ggml_reshape_3d(ctx, Qlin, n_embd_hq, nq, (int64_t)n_new);
+        ggml_tensor * Kcur = ggml_reshape_3d(ctx, Klin, n_embd_hq, nkv, (int64_t)n_new);
+        ggml_tensor * Vcur = ggml_reshape_3d(ctx, Vlin, n_embd_hv, nkv, (int64_t)n_new);
 
         if (lf.has_attn_q_norm) {
             ggml_tensor * w_qn = weight_view(ctx, find_w(GC_TENSOR_ATTN_Q_NORM, "weight", (int)il));
@@ -430,8 +458,12 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
 
         // ── RoPE ──────────────────────────────────────────────────────────────
         if (lf.apply_rope && rope_params_.n_dims > 0) {
-            Qcur = gc_rope_apply(ctx, Qcur, pos_t, nullptr, rope_params_);
-            Kcur = gc_rope_apply(ctx, Kcur, pos_t, nullptr, rope_params_);
+            gc_rope_params_t rope_l = rope_params_;
+            if (rope_l.n_dims > (int)n_embd_hq) {
+                rope_l.n_dims = (int)n_embd_hq;
+            }
+            Qcur = gc_rope_apply(ctx, Qcur, pos_t, nullptr, rope_l);
+            Kcur = gc_rope_apply(ctx, Kcur, pos_t, nullptr, rope_l);
         }
 
         // ── KV write (on-device, graph node) ─────────────────────────────────
@@ -693,6 +725,15 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
 
         const int n_new = (int)e.token_ids.size();
         const int n_ctx = e.num_computed + n_new;
+        auto push_no_token = [&](const char * reason) {
+            if (gc__trace_enabled()) {
+                std::fprintf(stderr,
+                    "[gc_trace][runner] no-token req=%s reason=%s prefill=%d last_prefill=%d computed=%d n_new=%d err=%s\n",
+                    e.req_id.c_str(), reason, e.is_prefill ? 1 : 0, e.is_last_prefill ? 1 : 0,
+                    e.num_computed, n_new, err_.c_str());
+            }
+            out.sampled_tokens.push_back(-1);
+        };
 
         // ── Pre-execution assertions ──────────────────────────────────────────
         // Assert no writes to null block (block_id=0 is the zero-pad sentinel).
@@ -704,7 +745,8 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
                 fprintf(stderr, "[gc_graph_runner] ASSERT: token %d mapped to null block "
                         "(req=%s, pos=%d)\n", i, e.req_id.c_str(), pos);
                 // Treat as error: emit -1 token and skip.
-                out.sampled_tokens.push_back(-1);
+                err_ = "token mapped to null block";
+                push_no_token("null-block");
                 goto next_entry;
             }
         }
@@ -713,7 +755,7 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             // ── Input tensor capacity ─────────────────────────────────────────
             if (!ensure_inp_capacity(n_new)) {
                 err_ = "input tensor allocation failed";
-                out.sampled_tokens.push_back(-1);
+                push_no_token("ensure-inp-capacity");
                 goto next_entry;
             }
 
@@ -741,7 +783,7 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             ggml_context * ctx = ggml_init(ip);
             if (!ctx) {
                 err_ = "graph context alloc failed";
-                out.sampled_tokens.push_back(-1);
+                push_no_token("ggml-init");
                 goto next_entry;
             }
 
@@ -750,7 +792,7 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             ggml_tensor * logits_t = build_graph(ctx, gf, e, &kq_mask);
             if (!logits_t) {
                 ggml_free(ctx);
-                out.sampled_tokens.push_back(-1);
+                push_no_token("build-graph");
                 goto next_entry;
             }
 
@@ -760,7 +802,8 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             if (!ggml_gallocr_alloc_graph(galloc_, gf)) {
                 stats_.graph_alloc_resized++;
                 ggml_free(ctx);
-                out.sampled_tokens.push_back(-1);
+                err_ = "ggml_gallocr_alloc_graph failed";
+                push_no_token("gallocr-alloc");
                 goto next_entry;
             } else {
                 stats_.graph_alloc_reused++;
@@ -787,7 +830,8 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
                 fprintf(stderr, "[gc_graph_runner] graph compute failed (req=%s status=%d)\n",
                         e.req_id.c_str(), (int)status);
                 ggml_free(ctx);
-                out.sampled_tokens.push_back(-1);
+                err_ = "ggml_backend_graph_compute failed";
+                push_no_token("graph-compute");
                 goto next_entry;
             }
             stats_.steps_executed++;
@@ -816,7 +860,7 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             // ── Sample or suppress ────────────────────────────────────────────
             if (e.is_prefill && !e.is_last_prefill) {
                 // Mid-prefill: no output token yet.
-                out.sampled_tokens.push_back(-1);
+                push_no_token("mid-prefill");
             } else {
                 apply_rep_penalty(logits, st);
                 const int32_t tok = sample(std::move(logits));

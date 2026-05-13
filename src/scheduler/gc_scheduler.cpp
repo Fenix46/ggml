@@ -2,8 +2,19 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
+
+namespace {
+static bool gc__trace_enabled() {
+    static int v = []() {
+        const char * e = std::getenv("GC_DEBUG_TRACE");
+        return (e && *e && std::string(e) != "0") ? 1 : 0;
+    }();
+    return v != 0;
+}
+}
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -397,11 +408,20 @@ void gc_scheduler_t::update_computed_tokens(
 
 void gc_scheduler_t::update_from_output(
         const std::unordered_map<std::string, int32_t> & new_tokens) {
+    if (gc__trace_enabled()) {
+        std::fprintf(stderr, "[gc_trace][sched] update_from_output n=%zu\n", new_tokens.size());
+    }
     for (auto & [req_id, tok] : new_tokens) {
         auto it = all_reqs_.find(req_id);
         if (it == all_reqs_.end()) continue;
         gc_request_t * req = it->second.get();
         if (req->status != GC_REQ_RUNNING) continue;
+
+        if (gc__trace_enabled()) {
+            std::fprintf(stderr,
+                "[gc_trace][sched] token req=%s tok=%d computed_before=%d out_before=%d\n",
+                req_id.c_str(), tok, req->num_computed_tokens, req->num_output_tokens());
+        }
 
         req->append_output_token(tok, params_.block_size);
         kv_mgr_.cache_blocks(req_id, req->block_hashes, req->num_computed_tokens);

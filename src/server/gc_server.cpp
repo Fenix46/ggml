@@ -5,12 +5,21 @@
 #include "vendor/json.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
+#include <cstdio>
 #include <sstream>
 
 using json = nlohmann::json;
 
 namespace {
+static bool gc__trace_enabled() {
+    static int v = []() {
+        const char * e = std::getenv("GC_DEBUG_TRACE");
+        return (e && *e && std::string(e) != "0") ? 1 : 0;
+    }();
+    return v != 0;
+}
 
 static std::string gc__extract_prompt(const json & in) {
     std::ostringstream oss;
@@ -157,6 +166,10 @@ std::string gc_engine_server_runtime_t::submit(const gc_server_request_t & req) 
     sp.ignore_eos = false;
 
     engine_->add_request(std::make_unique<gc_request_t>(req.id, toks, sp));
+    if (gc__trace_enabled()) {
+        std::fprintf(stderr, "[gc_trace][server] submit req=%s prompt_tokens=%zu max_tokens=%d eos=%d\n",
+                     req.id.c_str(), toks.size(), sp.max_tokens, (int)sp.eos_token_id);
+    }
     return req.id;
 }
 
@@ -173,12 +186,20 @@ std::vector<gc_server_token_event_t> gc_engine_server_runtime_t::step() {
     if (!engine_ || !engine_->has_work()) return out;
 
     const gc_step_output_t s = engine_->step();
+    if (gc__trace_enabled()) {
+        std::fprintf(stderr, "[gc_trace][server] step had_work=%d outputs=%zu scheduled=%d\n",
+                     s.had_work ? 1 : 0, s.outputs.size(), s.total_scheduled_tokens);
+    }
     out.reserve(s.outputs.size());
     for (const auto & o : s.outputs) {
         gc_server_token_event_t ev;
         ev.req_id = o.req_id;
         ev.token = o.token;
         ev.finished = o.finished;
+        if (gc__trace_enabled()) {
+            std::fprintf(stderr, "[gc_trace][server] event req=%s tok=%d finished=%d\n",
+                         ev.req_id.c_str(), ev.token, ev.finished ? 1 : 0);
+        }
         out.push_back(ev);
     }
     return out;
