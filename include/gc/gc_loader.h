@@ -1,6 +1,8 @@
 #pragma once
 
-#include "../../src/loader/gc_common.h"
-#include "../../src/loader/gc_mmap.h"
-#include "../../src/loader/gc_gguf_loader.h"
+// ── Public model loader API ───────────────────────────────────────────────────
+// Delegates to the full internal API from src/loader/.
+// Include via: #include <gc/gc_loader.h>
 
+#include "gc_status.h"
+#include "gc_gguf_loader.h"

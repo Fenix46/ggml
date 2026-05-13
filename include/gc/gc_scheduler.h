@@ -1,5 +1,8 @@
 #pragma once
 
-#include "../../src/scheduler/gc_request.h"
-#include "../../src/scheduler/gc_scheduler.h"
+// ── Public request scheduler API ──────────────────────────────────────────────
+// Delegates to the full internal API from src/scheduler/.
+// Include via: #include <gc/gc_scheduler.h>
 
+#include "gc_status.h"
+#include <gc_scheduler.h>

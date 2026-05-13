@@ -1,2 +1,2 @@
 #pragma once
-#include "../../src/arch/gc_arch_gemma_embedding.h"
+#include <gc_arch_gemma_embedding.h>
