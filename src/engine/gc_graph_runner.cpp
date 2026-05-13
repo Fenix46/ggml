@@ -26,17 +26,23 @@
 
 bool gc_kv_pool_t::init(ggml_backend_t backend,
                         uint32_t n_layer_, uint32_t num_blocks_, uint32_t block_size_,
-                        uint32_t n_kv_head_, uint32_t head_dim_) {
+                        const std::vector<int64_t> & layer_row_k,
+                        const std::vector<int64_t> & layer_row_v) {
     n_layer    = n_layer_;
     num_blocks = num_blocks_;
     block_size = block_size_;
-    n_kv_head  = n_kv_head_;
-    head_dim   = head_dim_;
-    row_size    = (int64_t)n_kv_head * head_dim;
     total_slots = (int64_t)num_blocks * block_size;
+    row_size_k = layer_row_k;
+    row_size_v = layer_row_v;
 
-    if (n_layer == 0 || num_blocks == 0 || block_size == 0 || row_size == 0) {
+    if (n_layer == 0 || num_blocks == 0 || block_size == 0) {
         return false;
+    }
+    if (row_size_k.size() != n_layer || row_size_v.size() != n_layer) {
+        return false;
+    }
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (row_size_k[il] <= 0 || row_size_v[il] <= 0) return false;
     }
 
     // Build a context with no_alloc=true — we only need tensor metadata,
@@ -47,12 +53,15 @@ bool gc_kv_pool_t::init(ggml_backend_t backend,
     if (!kv_ctx) return false;
 
     // Allocate K and V tensors for every layer.
-    // Shape: F32 [row_size, total_slots] — column = one KV slot, row = head dim.
+    // Shape per layer:
+    //   K: F32 [row_size_k[il], total_slots]
+    //   V: F32 [row_size_v[il], total_slots]
+    // column = one KV slot, row = flattened KV head width.
     k.resize(n_layer, nullptr);
     v.resize(n_layer, nullptr);
     for (uint32_t il = 0; il < n_layer; ++il) {
-        k[il] = ggml_new_tensor_2d(kv_ctx, GGML_TYPE_F32, row_size, total_slots);
-        v[il] = ggml_new_tensor_2d(kv_ctx, GGML_TYPE_F32, row_size, total_slots);
+        k[il] = ggml_new_tensor_2d(kv_ctx, GGML_TYPE_F32, row_size_k[il], total_slots);
+        v[il] = ggml_new_tensor_2d(kv_ctx, GGML_TYPE_F32, row_size_v[il], total_slots);
         if (!k[il] || !v[il]) { free(); return false; }
 
         char name[64];
@@ -69,11 +78,16 @@ bool gc_kv_pool_t::init(ggml_backend_t backend,
     // Zero-initialize (null block and fresh slots must read 0).
     ggml_backend_buffer_clear(kv_buf, 0);
 
+    const long long min_row_k = (long long)*std::min_element(row_size_k.begin(), row_size_k.end());
+    const long long max_row_k = (long long)*std::max_element(row_size_k.begin(), row_size_k.end());
+    const long long min_row_v = (long long)*std::min_element(row_size_v.begin(), row_size_v.end());
+    const long long max_row_v = (long long)*std::max_element(row_size_v.begin(), row_size_v.end());
+
     fprintf(stderr, "[gc_kv_pool] backend=%s  layers=%u  blocks=%u  block_size=%u  "
-            "row=%lld  total_slots=%lld  buf=%.1f MiB\n",
+            "k_row=[%lld..%lld]  v_row=[%lld..%lld]  total_slots=%lld  buf=%.1f MiB\n",
             ggml_backend_name(backend),
             n_layer, num_blocks, block_size,
-            (long long)row_size, (long long)total_slots,
+            min_row_k, max_row_k, min_row_v, max_row_v, (long long)total_slots,
             (double)ggml_backend_buffer_get_size(kv_buf) / (1024.0 * 1024.0));
 
     return true;
@@ -171,18 +185,28 @@ bool gc_graph_runner_t::init() {
     }
 
     // ── KV pool ───────────────────────────────────────────────────────────────
-    gc_attn_params_t ap0{};
-    if (!gc_arch_runtime_build_attn_params(hp_, 0, 1, ap0, &err)) {
-        err_ = "attn params layer0: " + err; return false;
+    std::vector<int64_t> kv_row_k((size_t)hp_.n_layer, 0);
+    std::vector<int64_t> kv_row_v((size_t)hp_.n_layer, 0);
+    for (uint32_t il = 0; il < hp_.n_layer; ++il) {
+        const gc_tensor_weight_t * wk = find_w(GC_TENSOR_ATTN_K, "weight", (int)il);
+        const gc_tensor_weight_t * wv = find_w(GC_TENSOR_ATTN_V, "weight", (int)il);
+        if (!wk || !wk->tensor || !wv || !wv->tensor) {
+            err_ = "missing attn K/V weight for layer " + std::to_string(il);
+            return false;
+        }
+        kv_row_k[il] = wk->tensor->ne[0];
+        kv_row_v[il] = wv->tensor->ne[0];
+        if (kv_row_k[il] <= 0 || kv_row_v[il] <= 0) {
+            err_ = "invalid attn K/V projection width at layer " + std::to_string(il);
+            return false;
+        }
     }
-    const uint32_t n_kv_head = (uint32_t)ap0.n_head_kv;
-    const uint32_t head_dim  = (uint32_t)ap0.n_embd_head_v;
 
     if (!kv_pool_.init(backend_,
                        (uint32_t)hp_.n_layer,
                        (uint32_t)cfg_.num_kv_blocks,
                        (uint32_t)cfg_.kv_block_size,
-                       n_kv_head, head_dim)) {
+                       kv_row_k, kv_row_v)) {
         err_ = "KV pool allocation failed"; return false;
     }
 
@@ -342,8 +366,6 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
             err_ = lerr; return nullptr;
         }
 
-        const int64_t n_embd_hq = ap.n_embd_head_q;
-        const int64_t n_embd_hv = ap.n_embd_head_v;
         const int64_t nq        = ap.n_head_q;
         const int64_t nkv       = ap.n_head_kv;
 
@@ -358,6 +380,25 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
         ggml_tensor * w_k = weight_view(ctx, find_w(GC_TENSOR_ATTN_K, "weight", (int)il));
         ggml_tensor * w_v = weight_view(ctx, find_w(GC_TENSOR_ATTN_V, "weight", (int)il));
         if (!w_q || !w_k || !w_v) { err_ = "missing attn QKV weight"; return nullptr; }
+
+        const int64_t proj_q = w_q->ne[0];
+        const int64_t proj_k = w_k->ne[0];
+        const int64_t proj_v = w_v->ne[0];
+        if (nq <= 0 || nkv <= 0 || proj_q <= 0 || proj_k <= 0 || proj_v <= 0) {
+            err_ = "invalid attention dimensions";
+            return nullptr;
+        }
+        if ((proj_q % nq) != 0 || (proj_k % nkv) != 0 || (proj_v % nkv) != 0) {
+            err_ = "projection width is not divisible by head count at layer " + std::to_string(il);
+            return nullptr;
+        }
+        const int64_t n_embd_hq = proj_q / nq;
+        const int64_t n_embd_hk = proj_k / nkv;
+        const int64_t n_embd_hv = proj_v / nkv;
+        if (n_embd_hq != n_embd_hk) {
+            err_ = "Q/K head dimension mismatch at layer " + std::to_string(il);
+            return nullptr;
+        }
 
         ggml_tensor * Qcur = ggml_reshape_3d(ctx,
             ggml_mul_mat(ctx, w_q, normed_attn), n_embd_hq, nq, (int64_t)n_new);
@@ -499,6 +540,8 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
         ggml_tensor * V3 = ggml_reshape_3d(ctx, V_full, n_embd_hv, nkv, (int64_t)n_ctx);
 
         gc_attn_params_t ap_full = ap;
+        ap_full.n_embd_head_q = n_embd_hq;
+        ap_full.n_embd_head_v = n_embd_hv;
         ap_full.n_tokens = (int64_t)n_new;
 
         ggml_tensor * attn_out = gc_build_attn_mha(ctx, gf,

@@ -52,18 +52,21 @@ struct gc_kv_pool_t {
     uint32_t n_layer    = 0;
     uint32_t num_blocks = 0;
     uint32_t block_size = 0;
-    uint32_t n_kv_head  = 0;
-    uint32_t head_dim   = 0;
+    // Per-layer row sizes (floats per slot column).
+    // row_size_k[il] == K projection width for layer il.
+    // row_size_v[il] == V projection width for layer il.
+    std::vector<int64_t> row_size_k;
+    std::vector<int64_t> row_size_v;
 
     // Derived
-    int64_t row_size    = 0;   // n_kv_head * head_dim (floats per slot)
     int64_t total_slots = 0;   // num_blocks * block_size
 
     // Initialize: allocate persistent KV tensors on the given backend.
     // Returns false on allocation failure.
     bool init(ggml_backend_t backend,
               uint32_t n_layer, uint32_t num_blocks, uint32_t block_size,
-              uint32_t n_kv_head, uint32_t head_dim);
+              const std::vector<int64_t> & layer_row_k,
+              const std::vector<int64_t> & layer_row_v);
 
     void free();
 
@@ -75,13 +78,6 @@ struct gc_kv_pool_t {
     gc_kv_pool_t & operator=(const gc_kv_pool_t &) = delete;
 
     bool ok() const { return kv_buf != nullptr; }
-
-    // Return byte offset into k[il] or v[il] for a given (block_id, slot_in_block).
-    // Used to build ggml_view_1d for a single slot's row.
-    size_t slot_byte_offset(int32_t block_id, uint32_t slot_in_block) const {
-        const size_t slot_idx = (size_t)block_id * block_size + slot_in_block;
-        return slot_idx * (size_t)row_size * sizeof(float);
-    }
 
     // Return the physical slot index for a logical token position given the block table.
     size_t token_slot_idx(const std::vector<int32_t> & block_ids,
