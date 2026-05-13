@@ -10,7 +10,7 @@ target_include_directories(gc_server PUBLIC
     ${CMAKE_SOURCE_DIR}/src/kvcache
 )
 
-target_link_libraries(gc_server PUBLIC gc_engine)
+target_link_libraries(gc_server PUBLIC gc_engine gc_chat)
 
 add_executable(gc_server_main
     gc_server_main.cpp
@@ -19,6 +19,7 @@ add_executable(gc_server_main
 target_link_libraries(gc_server_main PUBLIC
     gc_server
     gc_engine
+    gc_chat
     gc_loader
     gc_arch
     gc_vocab

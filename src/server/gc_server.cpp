@@ -35,6 +35,44 @@ static std::string gc__extract_prompt(const json & in) {
     return oss.str();
 }
 
+static std::string gc__extract_prompt_with_template(const json & in, gc_chat_template_t tmpl) {
+    if (tmpl == GC_CHAT_TEMPLATE_UNKNOWN) {
+        return gc__extract_prompt(in);
+    }
+
+    std::vector<std::string> roles;
+    std::vector<std::string> contents;
+    std::vector<gc_chat_message_t> msgs;
+    std::vector<const gc_chat_message_t *> ptrs;
+
+    const auto & in_msgs = in["messages"];
+    roles.reserve(in_msgs.size());
+    contents.reserve(in_msgs.size());
+    msgs.reserve(in_msgs.size());
+    ptrs.reserve(in_msgs.size());
+
+    for (const auto & m : in_msgs) {
+        if (!m.is_object()) continue;
+        const std::string role = m.value("role", "");
+        const std::string content = m.value("content", "");
+        if (role.empty() || content.empty()) continue;
+        roles.push_back(role);
+        contents.push_back(content);
+        msgs.push_back({roles.back().c_str(), contents.back().c_str()});
+        ptrs.push_back(&msgs.back());
+    }
+
+    if (ptrs.empty()) {
+        return gc__extract_prompt(in);
+    }
+
+    std::string prompt;
+    if (gc_chat_apply_template(tmpl, ptrs, prompt, true) < 0) {
+        return gc__extract_prompt(in);
+    }
+    return prompt;
+}
+
 static std::string gc__token_to_text(int32_t tok, const gc_server_detokenize_fn_t & detok) {
     if (detok) {
         try {
@@ -248,7 +286,7 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
         gc_server_request_t reqv;
         reqv.id = "req-" + std::to_string(impl_->next_req_id.fetch_add(1));
         reqv.model = in["model"].get<std::string>();
-        reqv.prompt_text = gc__extract_prompt(in);
+        reqv.prompt_text = gc__extract_prompt_with_template(in, params_.chat_template);
         reqv.max_tokens = in.value("max_tokens", 16);
         if (reqv.max_tokens <= 0) reqv.max_tokens = 1;
         if (reqv.max_tokens > 4096) reqv.max_tokens = 4096;

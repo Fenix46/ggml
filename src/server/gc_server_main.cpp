@@ -4,6 +4,7 @@
 #include "gc_gguf_loader.h"
 #include "gc_hparams.h"
 #include "gc_vocab.h"
+#include "gc_chat.h"
 
 #include <atomic>
 #include <algorithm>
@@ -97,6 +98,25 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        gc_chat_template_t chat_template = GC_CHAT_TEMPLATE_UNKNOWN;
+        std::string raw_template;
+        if (loader.get_str("tokenizer.chat_template", raw_template, /*required=*/false)) {
+            chat_template = gc_chat_detect_template(raw_template);
+        }
+        if (chat_template == GC_CHAT_TEMPLATE_UNKNOWN) {
+            switch (hp.arch) {
+                case GC_ARCH_GEMMA:
+                case GC_ARCH_GEMMA2:
+                case GC_ARCH_GEMMA3:
+                case GC_ARCH_GEMMA3N:
+                case GC_ARCH_GEMMA4:
+                    chat_template = GC_CHAT_TEMPLATE_GEMMA;
+                    break;
+                default:
+                    break;
+            }
+        }
+
         gc_engine_params_t ep;
         ep.sched.num_blocks = num_blocks;
         ep.sched.block_size = block_size;
@@ -138,6 +158,7 @@ int main(int argc, char ** argv) {
         sp.host = host;
         sp.port = port;
         sp.runtime = &runtime;
+        sp.chat_template = chat_template;
         sp.detokenize_fn = [&vocab](int32_t tok) {
             std::string s = vocab.detokenize({tok}, false);
             if (s.empty()) {
@@ -159,8 +180,8 @@ int main(int argc, char ** argv) {
         std::signal(SIGTERM, gc__signal_handler);
 
         std::fprintf(stderr,
-            "gc_server_main listening on %s:%d | model=%s | arch=%s | vocab=%d\n",
-            host.c_str(), port, model_path.c_str(), gc_arch_name(hp.arch), vocab.n_tokens());
+            "gc_server_main listening on %s:%d | model=%s | arch=%s | vocab=%d | chat_template=%d\n",
+            host.c_str(), port, model_path.c_str(), gc_arch_name(hp.arch), vocab.n_tokens(), (int) chat_template);
 
         while (!g_stop.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

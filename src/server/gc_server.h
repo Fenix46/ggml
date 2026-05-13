@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gc_chat.h"
+
 class gc_engine_t;
 
 struct gc_server_request_t {
@@ -61,6 +63,7 @@ struct gc_server_params_t {
     gc_server_runtime_t * runtime = nullptr; // non-owning; optional
     gc_server_detokenize_fn_t detokenize_fn;
     gc_server_detokenize_ids_fn_t detokenize_ids_fn;
+    gc_chat_template_t chat_template = GC_CHAT_TEMPLATE_UNKNOWN;
 };
 
 class gc_server_t {
