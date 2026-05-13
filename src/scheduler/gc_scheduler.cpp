@@ -324,8 +324,7 @@ done_running:
         num_new = std::min(num_new, params_.max_prefill_chunk_tokens);
         num_new = std::min(num_new, params_.max_model_len - num_computed);
         if (num_new <= 0) {
-            waiting_pop();
-            continue;
+            break;
         }
 
         const gc_req_blocks_t * rb = kv_mgr_.allocate_slots(
