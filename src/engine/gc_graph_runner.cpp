@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <string>
 
 namespace {
 static bool gc__trace_enabled() {
@@ -336,9 +337,9 @@ const gc_tensor_weight_t * gc_graph_runner_t::find_w(gc_tensor_role_t role,
 //   - Weight tensors: mmap-backed, not copied (CPU reads from disk/mmap as needed)
 
 ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
-                                               ggml_cgraph  * gf,
-                                               const gc_batch_entry_t & e,
-                                               ggml_tensor ** kq_mask_out) {
+                                             ggml_cgraph  * gf,
+                                             const gc_batch_entry_t & e,
+                                             ggml_tensor ** kq_mask_out) {
     const int n_new = (int)e.token_ids.size();
     const int n_ctx = e.num_computed + n_new;
     const gc_graph_cb_t cb = [](ggml_tensor *, const char *, int) {};
@@ -361,6 +362,46 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
 
     ggml_tensor * cur = ggml_get_rows(ctx, w_embd, tok_t);
     // cur: F32 [n_embd, n_new]  (dequantized by ggml_get_rows if quantized)
+    if (hp_.arch == GC_ARCH_GEMMA ||
+        hp_.arch == GC_ARCH_GEMMA2 ||
+        hp_.arch == GC_ARCH_GEMMA3 ||
+        hp_.arch == GC_ARCH_GEMMA3N ||
+        hp_.arch == GC_ARCH_GEMMA4 ||
+        hp_.arch == GC_ARCH_GEMMA_EMBEDDING) {
+        cur = ggml_scale(ctx, cur, std::sqrt((float) hp_.n_embd));
+    }
+
+    // Gemma4 per-layer input path (optional; enabled when tensors are present).
+    ggml_tensor * inp_per_layer = nullptr; // [n_embd_per_layer, n_new, n_layer]
+    if (const gc_tensor_weight_t * w_plt_ref = loader_->find_weight("per_layer_token_embd.weight")) {
+        const gc_tensor_weight_t * w_plm_ref = loader_->find_weight("per_layer_model_proj.weight");
+        const gc_tensor_weight_t * w_pln_ref = loader_->find_weight("per_layer_proj_norm.weight");
+        if (w_plm_ref && w_pln_ref && w_plt_ref->tensor && w_plm_ref->tensor && w_pln_ref->tensor) {
+            ggml_tensor * w_plt = weight_view(ctx, w_plt_ref);
+            ggml_tensor * w_plm = weight_view(ctx, w_plm_ref);
+            ggml_tensor * w_pln = weight_view(ctx, w_pln_ref);
+            if (w_plt && w_plm && w_pln) {
+                const int64_t n_embd_per_layer = w_pln->ne[0];
+                if (n_embd_per_layer > 0) {
+                    inp_per_layer = ggml_get_rows(ctx, w_plt, tok_t);
+                    inp_per_layer = ggml_reshape_3d(ctx, inp_per_layer,
+                                                    n_embd_per_layer, (int64_t) hp_.n_layer, (int64_t) n_new);
+                    inp_per_layer = ggml_scale(ctx, inp_per_layer, std::sqrt((float) n_embd_per_layer));
+
+                    ggml_tensor * per_layer_proj = ggml_mul_mat(ctx, w_plm, cur);
+                    per_layer_proj = ggml_scale(ctx, per_layer_proj, 1.0f / std::sqrt((float) hp_.n_embd));
+                    per_layer_proj = ggml_reshape_3d(ctx, per_layer_proj,
+                                                     n_embd_per_layer, (int64_t) hp_.n_layer, (int64_t) n_new);
+                    per_layer_proj = gc_build_norm(ctx, per_layer_proj, w_pln, nullptr,
+                                                   GC_NORM_RMS, norm_params_.eps, cb, -1);
+
+                    inp_per_layer = ggml_add(ctx, per_layer_proj, inp_per_layer);
+                    inp_per_layer = ggml_scale(ctx, inp_per_layer, 1.0f / std::sqrt(2.0f));
+                    inp_per_layer = ggml_cont(ctx, ggml_permute(ctx, inp_per_layer, 0, 2, 1, 3));
+                }
+            }
+        }
+    }
 
     // ── Causal mask ───────────────────────────────────────────────────────────
     // Allocated inside the no_alloc graph context — gallocr will back it.
@@ -434,6 +475,22 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
         ggml_tensor * Qcur = ggml_reshape_3d(ctx, Qlin, n_embd_hq, nq, (int64_t)n_new);
         ggml_tensor * Kcur = ggml_reshape_3d(ctx, Klin, n_embd_hq, nkv, (int64_t)n_new);
         ggml_tensor * Vcur = ggml_reshape_3d(ctx, Vlin, n_embd_hv, nkv, (int64_t)n_new);
+
+        const gc_tensor_weight_t * w_qn_ref = find_w(GC_TENSOR_ATTN_Q_NORM, "weight", (int)il);
+        const gc_tensor_weight_t * w_kn_ref = find_w(GC_TENSOR_ATTN_K_NORM, "weight", (int)il);
+        if (w_qn_ref && w_qn_ref->tensor) {
+            if (ggml_tensor * w_qn = weight_view(ctx, w_qn_ref)) {
+                Qcur = gc_build_norm(ctx, Qcur, w_qn, nullptr, GC_NORM_RMS, norm_params_.eps, cb, (int)il);
+            }
+        }
+        if (w_kn_ref && w_kn_ref->tensor) {
+            if (ggml_tensor * w_kn = weight_view(ctx, w_kn_ref)) {
+                Kcur = gc_build_norm(ctx, Kcur, w_kn, nullptr, GC_NORM_RMS, norm_params_.eps, cb, (int)il);
+            }
+            // Gemma4 applies RMS norm to V when per-head K/V norms are present.
+            Vcur = ggml_rms_norm(ctx, Vcur, norm_params_.eps);
+            cb(Vcur, "v_rms_norm", (int)il);
+        }
 
         if (lf.has_attn_q_norm) {
             ggml_tensor * w_qn = weight_view(ctx, find_w(GC_TENSOR_ATTN_Q_NORM, "weight", (int)il));
@@ -617,6 +674,41 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
         }
 
         cur = ggml_add(ctx, cur, ffn_out);
+
+        // Gemma4 per-layer residual branch (optional).
+        if (inp_per_layer) {
+            const std::string s_inp_gate = "blk." + std::to_string(il) + ".inp_gate.weight";
+            const std::string s_proj = "blk." + std::to_string(il) + ".proj.weight";
+            const std::string s_post = "blk." + std::to_string(il) + ".post_norm.weight";
+            const gc_tensor_weight_t * w_ig_ref = loader_->find_weight(s_inp_gate.c_str());
+            const gc_tensor_weight_t * w_pr_ref = loader_->find_weight(s_proj.c_str());
+            const gc_tensor_weight_t * w_pn_ref = loader_->find_weight(s_post.c_str());
+
+            if (w_ig_ref && w_pr_ref && w_pn_ref &&
+                w_ig_ref->tensor && w_pr_ref->tensor && w_pn_ref->tensor) {
+                ggml_tensor * w_ig = weight_view(ctx, w_ig_ref);
+                ggml_tensor * w_pr = weight_view(ctx, w_pr_ref);
+                ggml_tensor * w_pn = weight_view(ctx, w_pn_ref);
+                if (w_ig && w_pr && w_pn) {
+                    ggml_tensor * pe_in = cur;
+                    ggml_tensor * gate = ggml_mul_mat(ctx, w_ig, cur);
+                    gate = ggml_gelu(ctx, gate);
+
+                    const int64_t n_embd_per_layer = inp_per_layer->ne[0];
+                    const size_t off = (size_t) il * (size_t) inp_per_layer->nb[2];
+                    ggml_tensor * inp_this_layer = ggml_view_2d(
+                        ctx, inp_per_layer, n_embd_per_layer, (int64_t) n_new, inp_per_layer->nb[1], off);
+                    if (inp_this_layer->ne[0] != gate->ne[0] || inp_this_layer->ne[1] != gate->ne[1]) {
+                        inp_this_layer = ggml_reshape_2d(ctx, inp_this_layer, gate->ne[0], gate->ne[1]);
+                    }
+
+                    ggml_tensor * per_out = ggml_mul(ctx, gate, inp_this_layer);
+                    per_out = ggml_mul_mat(ctx, w_pr, per_out);
+                    per_out = gc_build_norm(ctx, per_out, w_pn, nullptr, GC_NORM_RMS, norm_params_.eps, cb, (int)il);
+                    cur = ggml_add(ctx, pe_in, per_out);
+                }
+            }
+        }
     }
 
     // ── Output norm + lm_head ─────────────────────────────────────────────────
@@ -631,6 +723,14 @@ ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
     if (!w_out) { err_ = "missing output weight"; return nullptr; }
 
     ggml_tensor * logits = ggml_mul_mat(ctx, w_out, cur);
+    if (hp_.f_logit_scale != 0.0f) {
+        logits = ggml_scale(ctx, logits, hp_.f_logit_scale);
+    }
+    if (hp_.f_final_logit_softcapping > 0.0f) {
+        logits = ggml_scale(ctx, logits, 1.0f / hp_.f_final_logit_softcapping);
+        logits = ggml_tanh(ctx, logits);
+        logits = ggml_scale(ctx, logits, hp_.f_final_logit_softcapping);
+    }
     ggml_set_name(logits, "logits");
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
@@ -654,6 +754,16 @@ void gc_graph_runner_t::apply_rep_penalty(std::vector<float> & logits,
 
 int32_t gc_graph_runner_t::sample(std::vector<float> logits) {
     const int vocab = (int)logits.size();
+    const bool force_greedy = []() {
+        const char * e = std::getenv("GC_FORCE_GREEDY");
+        return (e && *e && std::string(e) != "0");
+    }();
+
+    if (force_greedy) {
+        return (int32_t)std::distance(
+            logits.begin(),
+            std::max_element(logits.begin(), logits.end()));
+    }
 
     for (float & l : logits) l /= cfg_.temperature;
 
@@ -841,10 +951,12 @@ gc_model_output_t gc_graph_runner_t::execute(const gc_batch_t & batch) {
             // We need logits for the LAST token position only.
             const int64_t vocab = logits_t->ne[0];
             std::vector<float> logits((size_t)vocab);
-            // Offset to last token row: (n_new - 1) * vocab * sizeof(float)
+            // Offset to last token row: use tensor stride (nb[1]) rather than
+            // assuming tightly packed rows.
+            const size_t row_stride = (size_t) logits_t->nb[1];
             ggml_backend_tensor_get(logits_t,
                 logits.data(),
-                (size_t)(n_new - 1) * (size_t)vocab * sizeof(float),
+                (size_t)(n_new - 1) * row_stride,
                 (size_t)vocab * sizeof(float));
 
             ggml_free(ctx);
