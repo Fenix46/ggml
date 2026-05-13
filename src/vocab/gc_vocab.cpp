@@ -83,12 +83,12 @@ struct naive_trie {
 // tokenizers
 //
 
-struct llm_tokenizer {
-    llm_tokenizer() {}
-    virtual ~llm_tokenizer() = default;
+struct gc__tokenizer {
+    gc__tokenizer() {}
+    virtual ~gc__tokenizer() = default;
 };
 
-struct llm_symbol {
+struct gc__symbol {
     using index = int;
     index prev;
     index next;
@@ -96,41 +96,39 @@ struct llm_symbol {
     size_t n;
 };
 
-static_assert(std::is_trivially_copyable<llm_symbol>::value, "llm_symbol is not trivially copyable");
+static_assert(std::is_trivially_copyable<gc__symbol>::value, "gc__symbol is not trivially copyable");
 
 //
 // SPM tokenizer
-// original implementation:
-// https://github.com/ggml-org/llama.cpp/commit/074bea2eb1f1349a0118239c4152914aecaa1be4
 //
 
-struct llm_bigram_spm {
+struct gc__bigram_spm {
     struct comparator {
-        bool operator()(llm_bigram_spm & l, llm_bigram_spm & r) {
+        bool operator()(gc__bigram_spm & l, gc__bigram_spm & r) {
             return (l.score < r.score) || (l.score == r.score && l.left > r.left);
         }
     };
-    using queue_storage = std::vector<llm_bigram_spm>;
-    using queue = std::priority_queue<llm_bigram_spm, queue_storage, comparator>;
-    llm_symbol::index left;
-    llm_symbol::index right;
+    using queue_storage = std::vector<gc__bigram_spm>;
+    using queue = std::priority_queue<gc__bigram_spm, queue_storage, comparator>;
+    gc__symbol::index left;
+    gc__symbol::index right;
     float score;
     size_t size;
 };
 
-struct llm_tokenizer_spm : llm_tokenizer {
-    llm_tokenizer_spm(const gc_vocab_t & /*vocab*/) {}
+struct gc__tokenizer_spm : gc__tokenizer {
+    gc__tokenizer_spm(const gc_vocab_t & /*vocab*/) {}
 };
 
-struct llm_tokenizer_spm_session {
-    llm_tokenizer_spm_session(const gc_vocab_t & vocab) : vocab(vocab) {}
+struct gc__tokenizer_spm_session {
+    gc__tokenizer_spm_session(const gc_vocab_t & vocab) : vocab(vocab) {}
 
     void tokenize(const std::string & text, std::vector<gc_token_t> & output) {
         // split string into utf8 chars
         int index = 0;
         size_t offs = 0;
         while (offs < text.size()) {
-            llm_symbol sym;
+            gc__symbol sym;
             size_t len = gc_utf8_len(text[offs]);
             sym.text = text.c_str() + offs;
             sym.n = std::min(len, text.size() - offs);
@@ -184,7 +182,7 @@ struct llm_tokenizer_spm_session {
     }
 
 private:
-    void resegment(llm_symbol & symbol, std::vector<gc_token_t> & output) {
+    void resegment(gc__symbol & symbol, std::vector<gc_token_t> & output) {
         auto text = std::string(symbol.text, symbol.n);
         auto token = vocab.text_to_token(text);
 
@@ -227,7 +225,7 @@ private:
 
         const auto & tok_data = vocab.get_token_data(token);
 
-        llm_bigram_spm bigram;
+        gc__bigram_spm bigram;
         bigram.left  = left;
         bigram.right = right;
         bigram.score = tok_data.score;
@@ -241,10 +239,10 @@ private:
 
     const gc_vocab_t & vocab;
     // currently unused
-    // const llm_tokenizer_spm * spm_tokenizer;
+    // const gc__tokenizer_spm * spm_tokenizer;
 
-    std::vector<llm_symbol> symbols;
-    llm_bigram_spm::queue work_queue;
+    std::vector<gc__symbol> symbols;
+    gc__bigram_spm::queue work_queue;
     std::map<std::string, std::pair<int, int>> rev_merge;
 };
 
@@ -271,24 +269,24 @@ public:
     void pop() =  delete;
 };
 
-struct llm_bigram_bpe {
+struct gc__bigram_bpe {
     struct comparator {
-        bool operator()(const llm_bigram_bpe & l, const llm_bigram_bpe & r) const {
+        bool operator()(const gc__bigram_bpe & l, const gc__bigram_bpe & r) const {
             return l.rank > r.rank || (l.rank == r.rank && l.left > r.left);
         }
     };
 
-    using queue_storage = std::vector<llm_bigram_bpe>;
-    using queue = gc_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
-    llm_symbol::index left;
-    llm_symbol::index right;
+    using queue_storage = std::vector<gc__bigram_bpe>;
+    using queue = gc_priority_queue<gc__bigram_bpe, queue_storage, comparator>;
+    gc__symbol::index left;
+    gc__symbol::index right;
     std::string text;
     int rank;
     size_t size;
 };
 
-struct llm_tokenizer_bpe : llm_tokenizer {
-    llm_tokenizer_bpe(const gc_vocab_t & vocab) {
+struct gc__tokenizer_bpe : gc__tokenizer {
+    gc__tokenizer_bpe(const gc_vocab_t & vocab) {
         GGML_ASSERT(vocab.get_type() == GC_VOCAB_TYPE_BPE);
         switch (vocab.get_pre_type()) {
             case GC_VOCAB_PRE_LLAMA3:
@@ -538,8 +536,8 @@ struct llm_tokenizer_bpe : llm_tokenizer {
     bool byte_encode = true; // GPT-2 byte encoding; false for SPM-style BPE (raw UTF-8)
 };
 
-struct llm_tokenizer_bpe_session {
-    llm_tokenizer_bpe_session(const gc_vocab_t & vocab, const llm_tokenizer_bpe & tokenizer) : vocab(vocab), tokenizer(tokenizer) {}
+struct gc__tokenizer_bpe_session {
+    gc__tokenizer_bpe_session(const gc_vocab_t & vocab, const gc__tokenizer_bpe & tokenizer) : vocab(vocab), tokenizer(tokenizer) {}
 
     static void append(const gc_token_t token_id, std::vector<gc_token_t> & output)  {
         output.push_back(token_id);
@@ -586,7 +584,7 @@ struct llm_tokenizer_bpe_session {
         auto tok_pre = vocab.get_pre_type();
 
         for (const auto & word : word_collection) {
-            work_queue = llm_bigram_bpe::queue();
+            work_queue = gc__bigram_bpe::queue();
             symbols.clear();
 
             int index = 0;
@@ -594,19 +592,19 @@ struct llm_tokenizer_bpe_session {
 
             //if (vocab.tokenizer_ignore_merges && vocab.token_to_id.find(word) != vocab.token_to_id.end()) {
             if (vocab.get_ignore_merges() && vocab.text_to_token(word) != GC_TOKEN_NULL) {
-                symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
+                symbols.emplace_back(gc__symbol{-1, -1, word.c_str(), word.size()});
                 offset = word.size();
             } else if (tok_pre == GC_VOCAB_PRE_GEMMA4 && word.find_first_not_of('\n') == std::string::npos) {
                 // fix for gemma 4, ref: https://github.com/ggml-org/llama.cpp/pull/21343
                 auto tok = vocab.text_to_token(word);
                 if (tok != GC_TOKEN_NULL) {
-                    symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
+                    symbols.emplace_back(gc__symbol{-1, -1, word.c_str(), word.size()});
                     offset = word.size();
                 }
             }
 
             while (offset < word.size()) {
-                llm_symbol sym;
+                gc__symbol sym;
                 size_t char_len = std::min(word.size() - offset, (size_t) gc_utf8_len(word[offset]));
                 sym.text = word.c_str() + offset;
                 sym.n = char_len;
@@ -716,7 +714,7 @@ private:
             return;
         }
 
-        llm_bigram_bpe bigram;
+        gc__bigram_bpe bigram;
 
         bigram.left  = left;
         bigram.right = right;
@@ -728,23 +726,23 @@ private:
     }
 
     const gc_vocab_t & vocab;
-    const llm_tokenizer_bpe & tokenizer;
+    const gc__tokenizer_bpe & tokenizer;
 
-    std::vector<llm_symbol> symbols;
-    std::vector<llm_symbol> symbols_final;
-    llm_bigram_bpe::queue work_queue;
+    std::vector<gc__symbol> symbols;
+    std::vector<gc__symbol> symbols_final;
+    gc__bigram_bpe::queue work_queue;
 };
 
 //
 // WPM tokenizer
 //
 
-struct llm_tokenizer_wpm : llm_tokenizer {
-    llm_tokenizer_wpm(const gc_vocab_t & /*vocab*/) {}
+struct gc__tokenizer_wpm : gc__tokenizer {
+    gc__tokenizer_wpm(const gc_vocab_t & /*vocab*/) {}
 };
 
-struct llm_tokenizer_wpm_session {
-    llm_tokenizer_wpm_session(const gc_vocab_t & vocab) : vocab(vocab) {}
+struct gc__tokenizer_wpm_session {
+    gc__tokenizer_wpm_session(const gc_vocab_t & vocab) : vocab(vocab) {}
 
     void tokenize(const std::string & text, std::vector<gc_token_t> & output) {
         // normalize and split by whitespace
@@ -848,15 +846,15 @@ struct llm_tokenizer_wpm_session {
 private:
     const gc_vocab_t & vocab;
     // currently unused
-    // const llm_tokenizer_wpm * wpm_tokenizer;
+    // const gc__tokenizer_wpm * wpm_tokenizer;
 };
 
 //
 // UGM tokenizer
 //
 
-struct llm_tokenizer_ugm : llm_tokenizer {
-    llm_tokenizer_ugm(const gc_vocab_t & vocab, const std::vector<char> & precompiled_charsmap) {
+struct gc__tokenizer_ugm : gc__tokenizer {
+    gc__tokenizer_ugm(const gc_vocab_t & vocab, const std::vector<char> & precompiled_charsmap) {
         if (precompiled_charsmap.size() > 0) {
             size_t charsmap_offset = 0;
 
@@ -922,8 +920,8 @@ struct llm_tokenizer_ugm : llm_tokenizer {
     struct naive_trie token_matcher;
 };
 
-struct llm_tokenizer_ugm_session {
-    llm_tokenizer_ugm_session(const gc_vocab_t & vocab, const llm_tokenizer_ugm & tokenizer) : vocab(vocab), tokenizer(tokenizer) {}
+struct gc__tokenizer_ugm_session {
+    gc__tokenizer_ugm_session(const gc_vocab_t & vocab, const gc__tokenizer_ugm & tokenizer) : vocab(vocab), tokenizer(tokenizer) {}
 
     /* This implementation is based on SentencePiece optimized Viterbi algorithm for
      * unigram language models. The general idea is to:
@@ -1198,7 +1196,7 @@ private:
     }
 
     const gc_vocab_t & vocab;
-    const llm_tokenizer_ugm & tokenizer;
+    const gc__tokenizer_ugm & tokenizer;
 };
 
 //
@@ -1259,8 +1257,8 @@ static std::vector<uint8_t> gc__unescape_rwkv_token(const std::string & escaped)
     return output;
 }
 
-struct llm_tokenizer_rwkv : llm_tokenizer {
-    llm_tokenizer_rwkv(const gc_vocab_t & vocab) {
+struct gc__tokenizer_rwkv : gc__tokenizer {
+    gc__tokenizer_rwkv(const gc_vocab_t & vocab) {
         // RWKV supports arbitrary byte tokens, but the vocab struct only supports string tokens.
         // For now, we decode the vocab here into the lookup we'll use for tokenization.
 
@@ -1275,8 +1273,8 @@ struct llm_tokenizer_rwkv : llm_tokenizer {
     struct naive_trie token_matcher;
 };
 
-struct llm_tokenizer_rwkv_session {
-    llm_tokenizer_rwkv_session(const gc_vocab_t & vocab, const llm_tokenizer_rwkv & tokenizer) : vocab(vocab), tokenizer(tokenizer) {}
+struct gc__tokenizer_rwkv_session {
+    gc__tokenizer_rwkv_session(const gc_vocab_t & vocab, const gc__tokenizer_rwkv & tokenizer) : vocab(vocab), tokenizer(tokenizer) {}
 
     void tokenize(const std::string & text, std::vector<gc_token_t> & output) {
         uint32_t position = 0;
@@ -1308,11 +1306,11 @@ struct llm_tokenizer_rwkv_session {
 
 private:
     const gc_vocab_t & vocab;
-    const llm_tokenizer_rwkv & tokenizer;
+    const gc__tokenizer_rwkv & tokenizer;
 };
 
-struct llm_tokenizer_plamo2 : llm_tokenizer {
-    llm_tokenizer_plamo2(const gc_vocab_t & vocab) {
+struct gc__tokenizer_plamo2 : gc__tokenizer {
+    gc__tokenizer_plamo2(const gc_vocab_t & vocab) {
         build(vocab);
     }
 
@@ -1578,8 +1576,8 @@ private:
     std::vector<std::vector<int32_t>> table_;
 };
 
-struct llm_tokenizer_plamo2_session {
-    llm_tokenizer_plamo2_session(const llm_tokenizer_plamo2 & tokenizer) : tokenizer(tokenizer) {}
+struct gc__tokenizer_plamo2_session {
+    gc__tokenizer_plamo2_session(const gc__tokenizer_plamo2 & tokenizer) : tokenizer(tokenizer) {}
 
     void tokenize(const std::string & text, std::vector<gc_token_t> & output) {
         std::vector<gc_token_t> tokens = tokenizer.encode(text);
@@ -1587,7 +1585,7 @@ struct llm_tokenizer_plamo2_session {
     }
 
 private:
-    const llm_tokenizer_plamo2 & tokenizer;
+    const gc__tokenizer_plamo2 & tokenizer;
 };
 
 //
@@ -1687,7 +1685,7 @@ struct gc_vocab_t::impl {
     // set of all tokens that cause "end of generation"
     std::set<gc_token_t> special_eog_ids;
 
-    std::unique_ptr<llm_tokenizer> tokenizer;
+    std::unique_ptr<gc__tokenizer> tokenizer;
 
     std::vector<char> precompiled_charsmap;
 
@@ -2893,22 +2891,22 @@ void gc_vocab_t::impl::init_tokenizer(gc_vocab_type_t type) {
 
     switch (type) {
         case GC_VOCAB_TYPE_SPM:
-            tokenizer = std::make_unique<llm_tokenizer_spm>(vocab);
+            tokenizer = std::make_unique<gc__tokenizer_spm>(vocab);
             break;
         case GC_VOCAB_TYPE_BPE:
-            tokenizer = std::make_unique<llm_tokenizer_bpe>(vocab);
+            tokenizer = std::make_unique<gc__tokenizer_bpe>(vocab);
             break;
         case GC_VOCAB_TYPE_WPM:
-            tokenizer = std::make_unique<llm_tokenizer_wpm>(vocab);
+            tokenizer = std::make_unique<gc__tokenizer_wpm>(vocab);
             break;
         case GC_VOCAB_TYPE_UGM:
-            tokenizer = std::make_unique<llm_tokenizer_ugm>(vocab, precompiled_charsmap);
+            tokenizer = std::make_unique<gc__tokenizer_ugm>(vocab, precompiled_charsmap);
             break;
         case GC_VOCAB_TYPE_RWKV:
-            tokenizer = std::make_unique<llm_tokenizer_rwkv>(vocab);
+            tokenizer = std::make_unique<gc__tokenizer_rwkv>(vocab);
             break;
         case GC_VOCAB_TYPE_PLAMO2:
-            tokenizer = std::make_unique<llm_tokenizer_plamo2>(vocab);
+            tokenizer = std::make_unique<gc__tokenizer_plamo2>(vocab);
             break;
         default:
             GGML_ABORT("unsupported vocab type");
@@ -3137,7 +3135,7 @@ std::vector<gc_token_t> gc_vocab_t::impl::tokenize(
                         GC_LOG_WARN("TT: (%ld %ld %ld) '%s'\n", text.length(), fragment.offset, fragment.length, text.c_str());
 #endif
                         gc__escape_whitespace(text);
-                        llm_tokenizer_spm_session session(vocab);
+                        gc__tokenizer_spm_session session(vocab);
                         session.tokenize(text, output);
                         is_prev_special = false;
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
@@ -3160,8 +3158,8 @@ std::vector<gc_token_t> gc_vocab_t::impl::tokenize(
             } break;
         case GC_VOCAB_TYPE_BPE:
             {
-                llm_tokenizer_bpe_session session(vocab, *static_cast<const llm_tokenizer_bpe *>(tokenizer.get()));
-                // it calls some other methods that are not exist in llm_tokenizer,
+                gc__tokenizer_bpe_session session(vocab, *static_cast<const gc__tokenizer_bpe *>(tokenizer.get()));
+                // it calls some other methods that are not exist in gc__tokenizer,
                 // here just cast it to bpe tokenizer object
                 if (add_special) {
                     session.append_bos(output);
@@ -3195,7 +3193,7 @@ std::vector<gc_token_t> gc_vocab_t::impl::tokenize(
                     output.push_back(special_bos_id);
                 }
 
-                llm_tokenizer_wpm_session session(vocab);
+                gc__tokenizer_wpm_session session(vocab);
 
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
@@ -3221,7 +3219,7 @@ std::vector<gc_token_t> gc_vocab_t::impl::tokenize(
                     GGML_ASSERT(special_bos_id != GC_TOKEN_NULL);
                     output.push_back(special_bos_id);
                 }
-                llm_tokenizer_ugm_session session(vocab, *static_cast<const llm_tokenizer_ugm *>(tokenizer.get()));
+                gc__tokenizer_ugm_session session(vocab, *static_cast<const gc__tokenizer_ugm *>(tokenizer.get()));
 
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
@@ -3249,7 +3247,7 @@ std::vector<gc_token_t> gc_vocab_t::impl::tokenize(
             } break;
         case GC_VOCAB_TYPE_RWKV:
             {
-                llm_tokenizer_rwkv_session session(vocab, *static_cast<const llm_tokenizer_rwkv *>(tokenizer.get()));
+                gc__tokenizer_rwkv_session session(vocab, *static_cast<const gc__tokenizer_rwkv *>(tokenizer.get()));
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
@@ -3266,7 +3264,7 @@ std::vector<gc_token_t> gc_vocab_t::impl::tokenize(
             } break;
         case GC_VOCAB_TYPE_PLAMO2:
             {
-                llm_tokenizer_plamo2_session session(*static_cast<const llm_tokenizer_plamo2 *>(tokenizer.get()));
+                gc__tokenizer_plamo2_session session(*static_cast<const gc__tokenizer_plamo2 *>(tokenizer.get()));
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
