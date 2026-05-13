@@ -5,6 +5,7 @@ add_library(gc_server STATIC
 
 target_include_directories(gc_server PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src/engine
     ${CMAKE_SOURCE_DIR}/src/scheduler
     ${CMAKE_SOURCE_DIR}/src/kvcache
@@ -19,6 +20,9 @@ add_executable(gc_server_main
 
 target_include_directories(gc_server_main PRIVATE
     ${CMAKE_SOURCE_DIR}/src/chat
+    ${CMAKE_SOURCE_DIR}/src/loader
+    ${CMAKE_SOURCE_DIR}/src/arch
+    ${CMAKE_SOURCE_DIR}/src/vocab
 )
 
 target_link_libraries(gc_server_main PUBLIC

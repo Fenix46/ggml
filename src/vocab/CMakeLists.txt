@@ -9,6 +9,7 @@ target_include_directories(gc_vocab PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src/loader
     ${CMAKE_SOURCE_DIR}/src/arch
+    ${CMAKE_SOURCE_DIR}/src/common
 )
 
 target_link_libraries(gc_vocab PUBLIC gc_arch gc_loader ggml)
