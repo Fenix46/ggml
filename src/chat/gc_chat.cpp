@@ -1,628 +1,850 @@
 #include "gc_chat.h"
+#include "gc_debug.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstring>
 #include <map>
 #include <sstream>
+#include <stack>
+#include <stdexcept>
+#include <vector>
 
-#if __cplusplus >= 202000L
-    #define GCU8(x) (const char*)(u8##x)
-#else
-    #define GCU8(x) u8##x
-#endif
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TOKEN TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
 
-static std::string gc__chat_trim(const std::string & str) {
-    size_t start = 0;
-    size_t end = str.size();
-    while (start < end && isspace(static_cast<unsigned char>(str[start]))) {
-        start += 1;
-    }
-    while (end > start && isspace(static_cast<unsigned char>(str[end - 1]))) {
-        end -= 1;
-    }
-    return str.substr(start, end - start);
-}
-
-static const std::map<std::string, gc_chat_template_t> GC_CHAT_TEMPLATES = {
-    { "chatml",            GC_CHAT_TEMPLATE_CHATML            },
-    { "llama2",            GC_CHAT_TEMPLATE_LLAMA_2           },
-    { "llama2-sys",        GC_CHAT_TEMPLATE_LLAMA_2_SYS       },
-    { "llama2-sys-bos",    GC_CHAT_TEMPLATE_LLAMA_2_SYS_BOS   },
-    { "llama2-sys-strip",  GC_CHAT_TEMPLATE_LLAMA_2_SYS_STRIP },
-    { "mistral-v1",        GC_CHAT_TEMPLATE_MISTRAL_V1        },
-    { "mistral-v3",        GC_CHAT_TEMPLATE_MISTRAL_V3        },
-    { "mistral-v3-tekken", GC_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN },
-    { "mistral-v7",        GC_CHAT_TEMPLATE_MISTRAL_V7        },
-    { "mistral-v7-tekken", GC_CHAT_TEMPLATE_MISTRAL_V7_TEKKEN },
-    { "phi3",              GC_CHAT_TEMPLATE_PHI_3             },
-    { "phi4",              GC_CHAT_TEMPLATE_PHI_4             },
-    { "falcon3",           GC_CHAT_TEMPLATE_FALCON_3          },
-    { "zephyr",            GC_CHAT_TEMPLATE_ZEPHYR            },
-    { "monarch",           GC_CHAT_TEMPLATE_MONARCH           },
-    { "gemma",             GC_CHAT_TEMPLATE_GEMMA             },
-    { "orion",             GC_CHAT_TEMPLATE_ORION             },
-    { "openchat",          GC_CHAT_TEMPLATE_OPENCHAT          },
-    { "vicuna",            GC_CHAT_TEMPLATE_VICUNA            },
-    { "vicuna-orca",       GC_CHAT_TEMPLATE_VICUNA_ORCA       },
-    { "deepseek",          GC_CHAT_TEMPLATE_DEEPSEEK          },
-    { "deepseek2",         GC_CHAT_TEMPLATE_DEEPSEEK_2        },
-    { "deepseek3",         GC_CHAT_TEMPLATE_DEEPSEEK_3        },
-    { "deepseek-ocr",      GC_CHAT_TEMPLATE_DEEPSEEK_OCR      },
-    { "command-r",         GC_CHAT_TEMPLATE_COMMAND_R         },
-    { "llama3",            GC_CHAT_TEMPLATE_LLAMA_3           },
-    { "chatglm3",          GC_CHAT_TEMPLATE_CHATGLM_3         },
-    { "chatglm4",          GC_CHAT_TEMPLATE_CHATGLM_4         },
-    { "glmedge",           GC_CHAT_TEMPLATE_GLMEDGE           },
-    { "minicpm",           GC_CHAT_TEMPLATE_MINICPM           },
-    { "exaone3",           GC_CHAT_TEMPLATE_EXAONE_3          },
-    { "exaone4",           GC_CHAT_TEMPLATE_EXAONE_4          },
-    { "exaone-moe",        GC_CHAT_TEMPLATE_EXAONE_MOE        },
-    { "rwkv-world",        GC_CHAT_TEMPLATE_RWKV_WORLD        },
-    { "granite",           GC_CHAT_TEMPLATE_GRANITE_3_X       },
-    { "granite-4.0",       GC_CHAT_TEMPLATE_GRANITE_4_0       },
-    { "gigachat",          GC_CHAT_TEMPLATE_GIGACHAT          },
-    { "megrez",            GC_CHAT_TEMPLATE_MEGREZ            },
-    { "yandex",            GC_CHAT_TEMPLATE_YANDEX            },
-    { "bailing",           GC_CHAT_TEMPLATE_BAILING           },
-    { "bailing-think",     GC_CHAT_TEMPLATE_BAILING_THINK     },
-    { "bailing2",          GC_CHAT_TEMPLATE_BAILING2          },
-    { "llama4",            GC_CHAT_TEMPLATE_LLAMA4            },
-    { "smolvlm",           GC_CHAT_TEMPLATE_SMOLVLM           },
-    { "hunyuan-moe",       GC_CHAT_TEMPLATE_HUNYUAN_MOE       },
-    { "gpt-oss",           GC_CHAT_TEMPLATE_OPENAI_MOE        },
-    { "hunyuan-dense",     GC_CHAT_TEMPLATE_HUNYUAN_DENSE     },
-    { "hunyuan-ocr",       GC_CHAT_TEMPLATE_HUNYUAN_OCR       },
-    { "kimi-k2",           GC_CHAT_TEMPLATE_KIMI_K2           },
-    { "seed_oss",          GC_CHAT_TEMPLATE_SEED_OSS          },
-    { "grok-2",            GC_CHAT_TEMPLATE_GROK_2            },
-    { "pangu-embedded",    GC_CHAT_TEMPLATE_PANGU_EMBED       },
-    { "solar-open",        GC_CHAT_TEMPLATE_SOLAR_OPEN        },
+enum class TokenType {
+    Text,               // raw text between delimiters
+    VariableOpen,       // {{
+    VariableClose,      // }}
+    TagOpen,            // {%
+    TagClose,           // %}
+    CommentOpen,        // {#
+    CommentClose,       // #}
+    Identifier,         // a-z A-Z _ . 0-9
+    Number,             // int or float
+    String,             // "..." or '...'
+    Op,                 // == != < > <= >=
+    Comma,              // ,
+    Dot,                // .
+    Pipe,               // |
+    Assign,             // =
+    Eof,
 };
 
-gc_chat_template_t gc_chat_template_from_str(const std::string & name) {
-    return GC_CHAT_TEMPLATES.at(name);
-}
+struct Token {
+    TokenType  type;
+    std::string value;
+    size_t     pos;    // source position for error messages
+};
 
-gc_chat_template_t gc_chat_detect_template(const std::string & tmpl) {
-    try {
-        return gc_chat_template_from_str(tmpl);
-    } catch (const std::out_of_range &) {
-        // not a short name — fall through to heuristic detection
+// ═══════════════════════════════════════════════════════════════════════════════
+//  AST NODES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct AstNode {
+    enum Kind {
+        kRoot,
+        kText,
+        kExpr,       // {{ expr }}
+        kIf,
+        kElse,
+        kEndIf,
+        kFor,
+        kEndFor,
+        kSet,
+    };
+    Kind kind;
+
+    // kText
+    std::string text;
+
+    // kExpr: variable path + filter chain
+    std::string expr_var;        // e.g. "messages[0].content"
+    std::vector<std::string> filters;  // e.g. strip, upper
+
+    // kIf / kElse
+    std::string cond_var;        // variable name for condition
+    bool        cond_truth;      // computed at render time
+
+    // kFor
+    std::string loop_var;        // e.g. "item"
+    std::string loop_iter;       // e.g. "messages"
+
+    // kSet
+    std::string set_var;
+    std::string set_expr;
+
+    // Children
+    std::vector<AstNode> children;
+};
+
+struct AstRoot {
+    std::vector<AstNode> nodes;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LEXER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class Lexer {
+public:
+    explicit Lexer(const std::string & src)
+        : src_(src), pos_(0), line_(1), col_(0) {}
+
+    std::vector<Token> tokenize();
+
+private:
+    const std::string & src_;
+    size_t             pos_;
+    int                line_;
+    int                col_;
+
+    char peek()  const { return pos_ < src_.size() ? src_[pos_] : '\0'; }
+    char adv()         { char c = src_[pos_++]; col_++; if (c == '\n') { line_++; col_=0; } return c; }
+    void skip_ws()     { while (peek() && (peek() == ' ' || peek() == '\t' || peek() == '\n')) adv(); }
+
+    Token make(TokenType t, std::string v = "") {
+        return Token{t, std::move(v), pos_};
     }
 
-    auto contains = [&tmpl](const char * hay) -> bool {
-        return tmpl.find(hay) != std::string::npos;
+    Token make(TokenType t, const char * s, size_t len) {
+        return Token{t, std::string(s, len), pos_};
+    }
+
+    void error(const std::string & msg);
+};
+
+std::vector<Token> Lexer::tokenize() {
+    std::vector<Token> tokens;
+    size_t text_start = 0;
+    bool   in_text    = true;
+
+    auto emit_text = [&]() {
+        if (pos_ > text_start) {
+            tokens.push_back(make(TokenType::Text, &src_[text_start], pos_ - text_start));
+        }
     };
 
-    if (contains("<|im_start|>")) {
-        return contains("<|im_sep|>")
-            ? GC_CHAT_TEMPLATE_PHI_4
-            : contains("<end_of_utterance>")
-                ? GC_CHAT_TEMPLATE_SMOLVLM
-                : GC_CHAT_TEMPLATE_CHATML;
-    } else if (tmpl.find("mistral") == 0 || contains("[INST]")) {
-        if (contains("[SYSTEM_PROMPT]")) {
-            return GC_CHAT_TEMPLATE_MISTRAL_V7;
-        } else if (contains("' [INST] ' + system_message") || contains("[AVAILABLE_TOOLS]")) {
-            if (contains(" [INST]")) {
-                return GC_CHAT_TEMPLATE_MISTRAL_V1;
-            } else if (contains("\"[INST]\"")) {
-                return GC_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN;
-            }
-            return GC_CHAT_TEMPLATE_MISTRAL_V3;
-        } else {
-            bool support_system_message  = contains("<<SYS>>");
-            bool add_bos_inside_history  = contains("bos_token + '[INST]");
-            bool strip_message           = contains("content.strip()");
-            if (strip_message)              return GC_CHAT_TEMPLATE_LLAMA_2_SYS_STRIP;
-            else if (add_bos_inside_history) return GC_CHAT_TEMPLATE_LLAMA_2_SYS_BOS;
-            else if (support_system_message) return GC_CHAT_TEMPLATE_LLAMA_2_SYS;
-            else                             return GC_CHAT_TEMPLATE_LLAMA_2;
-        }
-    } else if (contains("<|assistant|>") && contains("<|end|>")) {
-        return GC_CHAT_TEMPLATE_PHI_3;
-    } else if (contains("[gMASK]<sop>")) {
-        return GC_CHAT_TEMPLATE_CHATGLM_4;
-    } else if (contains("<|assistant|>") && contains("<|user|>")) {
-        if (contains("<|tool_declare|>")) return GC_CHAT_TEMPLATE_EXAONE_MOE;
-        return contains("</s>") ? GC_CHAT_TEMPLATE_FALCON_3 : GC_CHAT_TEMPLATE_GLMEDGE;
-    } else if (contains("<|{{ item['role'] }}|>") && contains("<|begin_of_image|>")) {
-        return GC_CHAT_TEMPLATE_GLMEDGE;
-    } else if (contains("<|user|>") && contains("<|endoftext|>")) {
-        return GC_CHAT_TEMPLATE_ZEPHYR;
-    } else if (contains("bos_token + message['role']")) {
-        return GC_CHAT_TEMPLATE_MONARCH;
-    } else if (contains("<start_of_turn>")) {
-        return GC_CHAT_TEMPLATE_GEMMA;
-    } else if (contains("'\\n\\nAssistant: ' + eos_token")) {
-        return GC_CHAT_TEMPLATE_ORION;
-    } else if (contains("GPT4 Correct ")) {
-        return GC_CHAT_TEMPLATE_OPENCHAT;
-    } else if (contains("USER: ") && contains("ASSISTANT: ")) {
-        return contains("SYSTEM: ") ? GC_CHAT_TEMPLATE_VICUNA_ORCA : GC_CHAT_TEMPLATE_VICUNA;
-    } else if (contains("### Instruction:") && contains("<|EOT|>")) {
-        return GC_CHAT_TEMPLATE_DEEPSEEK;
-    } else if (contains("<|START_OF_TURN_TOKEN|>") && contains("<|USER_TOKEN|>")) {
-        return GC_CHAT_TEMPLATE_COMMAND_R;
-    } else if (contains("<|start_header_id|>") && contains("<|end_header_id|>")) {
-        return GC_CHAT_TEMPLATE_LLAMA_3;
-    } else if (contains("[gMASK]sop")) {
-        return GC_CHAT_TEMPLATE_CHATGLM_3;
-    } else if (contains(GCU8("<用户>"))) {
-        return GC_CHAT_TEMPLATE_MINICPM;
-    } else if (contains("'Assistant: ' + message['content'] + eos_token")) {
-        return GC_CHAT_TEMPLATE_DEEPSEEK_2;
-    } else if (contains(GCU8("<｜Assistant｜>")) && contains(GCU8("<｜User｜>")) && contains(GCU8("<｜end▁of▁sentence｜>"))) {
-        return GC_CHAT_TEMPLATE_DEEPSEEK_3;
-    } else if (contains("[|system|]") && contains("[|assistant|]") && contains("[|endofturn|]")) {
-        return contains("[|tool|]") ? GC_CHAT_TEMPLATE_EXAONE_4 : GC_CHAT_TEMPLATE_EXAONE_3;
-    } else if (contains("rwkv-world") || contains("{{- 'User: ' + message['content']|trim + '\\n\\n' -}}")) {
-        return GC_CHAT_TEMPLATE_RWKV_WORLD;
-    } else if (contains("<|start_of_role|>")) {
-        return (contains("<tool_call>") || contains("<tools>")) ? GC_CHAT_TEMPLATE_GRANITE_4_0 : GC_CHAT_TEMPLATE_GRANITE_3_X;
-    } else if (contains("message['role'] + additional_special_tokens[0] + message['content'] + additional_special_tokens[1]")) {
-        return GC_CHAT_TEMPLATE_GIGACHAT;
-    } else if (contains("<|role_start|>")) {
-        return GC_CHAT_TEMPLATE_MEGREZ;
-    } else if (contains(" Ассистент:")) {
-        return GC_CHAT_TEMPLATE_YANDEX;
-    } else if (contains("<role>ASSISTANT</role>") && contains("'HUMAN'")) {
-        return GC_CHAT_TEMPLATE_BAILING;
-    } else if (contains("<role>ASSISTANT</role>") && contains("\"HUMAN\"") && contains("<think>")) {
-        return GC_CHAT_TEMPLATE_BAILING_THINK;
-    } else if (contains("<role>ASSISTANT</role>") && contains("<role>HUMAN</role>") && contains("<|role_end|>")) {
-        return GC_CHAT_TEMPLATE_BAILING2;
-    } else if (contains("<|header_start|>") && contains("<|header_end|>")) {
-        return GC_CHAT_TEMPLATE_LLAMA4;
-    } else if (contains("<|endofuserprompt|>")) {
-        return GC_CHAT_TEMPLATE_DOTS1;
-    } else if (contains("<|extra_0|>") && contains("<|extra_4|>")) {
-        return GC_CHAT_TEMPLATE_HUNYUAN_MOE;
-    } else if (contains("<|start|>") && contains("<|channel|>")) {
-        return GC_CHAT_TEMPLATE_OPENAI_MOE;
-    } else if (contains(GCU8("<｜hy_Assistant｜>")) && contains(GCU8("<｜hy_begin▁of▁sentence｜>"))) {
-        return GC_CHAT_TEMPLATE_HUNYUAN_OCR;
-    } else if (contains(GCU8("<｜hy_Assistant｜>")) && contains(GCU8("<｜hy_place▁holder▁no▁3｜>"))) {
-        return GC_CHAT_TEMPLATE_HUNYUAN_DENSE;
-    } else if (contains("<|im_assistant|>assistant<|im_middle|>")) {
-        return GC_CHAT_TEMPLATE_KIMI_K2;
-    } else if (contains("<seed:bos>")) {
-        return GC_CHAT_TEMPLATE_SEED_OSS;
-    } else if (contains("'Assistant: '  + message['content'] + '<|separator|>")) {
-        return GC_CHAT_TEMPLATE_GROK_2;
-    } else if (contains(GCU8("[unused9]系统：[unused10]"))) {
-        return GC_CHAT_TEMPLATE_PANGU_EMBED;
-    } else if (contains("<|begin|>") && contains("<|end|>") && contains("<|content|>")) {
-        return GC_CHAT_TEMPLATE_SOLAR_OPEN;
-    }
-    return GC_CHAT_TEMPLATE_UNKNOWN;
-}
-
-int32_t gc_chat_apply_template(
-        gc_chat_template_t                            tmpl,
-        const std::vector<const gc_chat_message_t *> & chat,
-        std::string &                                  dest,
-        bool                                           add_ass) {
-    std::stringstream ss;
-
-    if (tmpl == GC_CHAT_TEMPLATE_CHATML) {
-        for (auto msg : chat) {
-            ss << "<|im_start|>" << msg->role << "\n" << msg->content << "<|im_end|>\n";
-        }
-        if (add_ass) ss << "<|im_start|>assistant\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_MISTRAL_V7 || tmpl == GC_CHAT_TEMPLATE_MISTRAL_V7_TEKKEN) {
-        const char * trailing = (tmpl == GC_CHAT_TEMPLATE_MISTRAL_V7) ? " " : "";
-        for (auto msg : chat) {
-            std::string role(msg->role), content(msg->content);
-            if (role == "system") {
-                ss << "[SYSTEM_PROMPT]" << trailing << content << "[/SYSTEM_PROMPT]";
-            } else if (role == "user") {
-                ss << "[INST]" << trailing << content << "[/INST]";
-            } else {
-                ss << trailing << content << "</s>";
-            }
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_MISTRAL_V1
-            || tmpl == GC_CHAT_TEMPLATE_MISTRAL_V3
-            || tmpl == GC_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN) {
-        std::string leading  = (tmpl == GC_CHAT_TEMPLATE_MISTRAL_V1) ? " " : "";
-        std::string trailing = (tmpl == GC_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN) ? "" : " ";
-        bool trim_ass = (tmpl == GC_CHAT_TEMPLATE_MISTRAL_V3);
-        bool inside = false;
-        for (auto msg : chat) {
-            if (!inside) { ss << leading << "[INST]" << trailing; inside = true; }
-            std::string role(msg->role), content(msg->content);
-            if (role == "system") {
-                ss << content << "\n\n";
-            } else if (role == "user") {
-                ss << content << leading << "[/INST]";
-            } else {
-                ss << trailing << (trim_ass ? gc__chat_trim(content) : content) << "</s>";
-                inside = false;
-            }
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_LLAMA_2
-            || tmpl == GC_CHAT_TEMPLATE_LLAMA_2_SYS
-            || tmpl == GC_CHAT_TEMPLATE_LLAMA_2_SYS_BOS
-            || tmpl == GC_CHAT_TEMPLATE_LLAMA_2_SYS_STRIP) {
-        bool support_sys  = (tmpl != GC_CHAT_TEMPLATE_LLAMA_2);
-        bool bos_history  = (tmpl == GC_CHAT_TEMPLATE_LLAMA_2_SYS_BOS);
-        bool strip_msg    = (tmpl == GC_CHAT_TEMPLATE_LLAMA_2_SYS_STRIP);
-        bool inside = true;
-        ss << "[INST] ";
-        for (auto msg : chat) {
-            std::string content = strip_msg ? gc__chat_trim(msg->content) : std::string(msg->content);
-            std::string role(msg->role);
-            if (!inside) { ss << (bos_history ? "<s>[INST] " : "[INST] "); inside = true; }
-            if (role == "system") {
-                ss << (support_sys ? "<<SYS>>\n" + content + "\n<</SYS>>\n\n" : content + "\n");
-            } else if (role == "user") {
-                ss << content << " [/INST]";
-            } else {
-                ss << content << "</s>";
-                inside = false;
-            }
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_PHI_3) {
-        for (auto msg : chat) {
-            ss << "<|" << msg->role << "|>\n" << msg->content << "<|end|>\n";
-        }
-        if (add_ass) ss << "<|assistant|>\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_PHI_4) {
-        for (auto msg : chat) {
-            ss << "<|im_start|>" << msg->role << "<|im_sep|>" << msg->content << "<|im_end|>";
-        }
-        if (add_ass) ss << "<|im_start|>assistant<|im_sep|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_FALCON_3) {
-        for (auto msg : chat) {
-            ss << "<|" << msg->role << "|>\n" << msg->content << "\n";
-        }
-        if (add_ass) ss << "<|assistant|>\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_ZEPHYR) {
-        for (auto msg : chat) {
-            ss << "<|" << msg->role << "|>\n" << msg->content << "<|endoftext|>\n";
-        }
-        if (add_ass) ss << "<|assistant|>\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_MONARCH) {
-        for (auto msg : chat) {
-            std::string bos = (msg == chat.front()) ? "" : "<s>";
-            ss << bos << msg->role << "\n" << msg->content << "</s>\n";
-        }
-        if (add_ass) ss << "<s>assistant\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_GEMMA) {
-        std::string sys_prompt;
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system") { sys_prompt += gc__chat_trim(msg->content); continue; }
-            role = (role == "assistant") ? "model" : role;
-            ss << "<start_of_turn>" << role << "\n";
-            if (!sys_prompt.empty() && role != "model") { ss << sys_prompt << "\n\n"; sys_prompt.clear(); }
-            ss << gc__chat_trim(msg->content) << "<end_of_turn>\n";
-        }
-        if (add_ass) ss << "<start_of_turn>model\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_ORION) {
-        std::string sys_prompt;
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system") { sys_prompt += msg->content; continue; }
-            if (role == "user") {
-                ss << "Human: ";
-                if (!sys_prompt.empty()) { ss << sys_prompt << "\n\n"; sys_prompt.clear(); }
-                ss << msg->content << "\n\nAssistant: </s>";
-            } else {
-                ss << msg->content << "</s>";
-            }
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_OPENCHAT) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system") {
-                ss << msg->content << "<|end_of_turn|>";
-            } else {
-                role[0] = (char)toupper((unsigned char)role[0]);
-                ss << "GPT4 Correct " << role << ": " << msg->content << "<|end_of_turn|>";
-            }
-        }
-        if (add_ass) ss << "GPT4 Correct Assistant:";
-    } else if (tmpl == GC_CHAT_TEMPLATE_VICUNA || tmpl == GC_CHAT_TEMPLATE_VICUNA_ORCA) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system") {
-                ss << (tmpl == GC_CHAT_TEMPLATE_VICUNA_ORCA ? "SYSTEM: " + std::string(msg->content) + "\n" : std::string(msg->content) + "\n\n");
-            } else if (role == "user") {
-                ss << "USER: " << msg->content << "\n";
-            } else if (role == "assistant") {
-                ss << "ASSISTANT: " << msg->content << "</s>\n";
-            }
-        }
-        if (add_ass) ss << "ASSISTANT:";
-    } else if (tmpl == GC_CHAT_TEMPLATE_DEEPSEEK) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system") {
-                ss << msg->content;
-            } else if (role == "user") {
-                ss << "### Instruction:\n" << msg->content << "\n";
-            } else if (role == "assistant") {
-                ss << "### Response:\n" << msg->content << "\n<|EOT|>\n";
-            }
-        }
-        if (add_ass) ss << "### Response:\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_COMMAND_R) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system") {
-                ss << "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>" << gc__chat_trim(msg->content) << "<|END_OF_TURN_TOKEN|>";
-            } else if (role == "user") {
-                ss << "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>" << gc__chat_trim(msg->content) << "<|END_OF_TURN_TOKEN|>";
-            } else if (role == "assistant") {
-                ss << "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>" << gc__chat_trim(msg->content) << "<|END_OF_TURN_TOKEN|>";
-            }
-        }
-        if (add_ass) ss << "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_LLAMA_3) {
-        ss << "<|begin_of_text|>";
-        for (auto msg : chat) {
-            ss << "<|start_header_id|>" << msg->role << "<|end_header_id|>\n\n"
-               << gc__chat_trim(msg->content) << "<|eot_id|>";
-        }
-        if (add_ass) ss << "<|start_header_id|>assistant<|end_header_id|>\n\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_CHATGLM_3) {
-        ss << "[gMASK]sop";
-        for (auto msg : chat) {
-            ss << "<|" << msg->role << "|>\n " << msg->content;
-        }
-        if (add_ass) ss << "<|assistant|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_CHATGLM_4) {
-        ss << "[gMASK]<sop>";
-        for (auto msg : chat) {
-            ss << "<|" << msg->role << "|>\n" << msg->content;
-        }
-        if (add_ass) ss << "<|assistant|>\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_GLMEDGE) {
-        for (auto msg : chat) {
-            ss << "<|" << msg->role << "|>\n" << msg->content;
-        }
-        if (add_ass) ss << "<|assistant|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_MINICPM) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "user") {
-                ss << GCU8("<用户>") << gc__chat_trim(msg->content) << "<AI>";
-            } else {
-                ss << gc__chat_trim(msg->content);
-            }
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_DEEPSEEK_2) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << msg->content << "\n\n";
-            else if (role == "user")      ss << "User: " << msg->content << "\n\n";
-            else if (role == "assistant") ss << "Assistant: " << msg->content << GCU8("<｜end▁of▁sentence｜>");
-        }
-        if (add_ass) ss << "Assistant:";
-    } else if (tmpl == GC_CHAT_TEMPLATE_DEEPSEEK_3) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << msg->content << "\n\n";
-            else if (role == "user")      ss << GCU8("<｜User｜>") << msg->content;
-            else if (role == "assistant") ss << GCU8("<｜Assistant｜>") << msg->content << GCU8("<｜end▁of▁sentence｜>");
-        }
-        if (add_ass) ss << GCU8("<｜Assistant｜>");
-    } else if (tmpl == GC_CHAT_TEMPLATE_DEEPSEEK_OCR) {
-        for (auto msg : chat) ss << msg->content;
-    } else if (tmpl == GC_CHAT_TEMPLATE_EXAONE_3) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << "[|system|]"    << gc__chat_trim(msg->content) << "[|endofturn|]\n";
-            else if (role == "user")      ss << "[|user|]"      << gc__chat_trim(msg->content) << "\n";
-            else if (role == "assistant") ss << "[|assistant|]" << gc__chat_trim(msg->content) << "[|endofturn|]\n";
-        }
-        if (add_ass) ss << "[|assistant|]";
-    } else if (tmpl == GC_CHAT_TEMPLATE_EXAONE_4) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << "[|system|]"    << gc__chat_trim(msg->content) << "[|endofturn|]\n";
-            else if (role == "user")      ss << "[|user|]"      << gc__chat_trim(msg->content) << "\n";
-            else if (role == "assistant") ss << "[|assistant|]" << gc__chat_trim(msg->content) << "[|endofturn|]\n";
-            else if (role == "tool")      ss << "[|tool|]"      << gc__chat_trim(msg->content) << "[|endofturn|]\n";
-        }
-        if (add_ass) ss << "[|assistant|]";
-    } else if (tmpl == GC_CHAT_TEMPLATE_EXAONE_MOE) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << "<|system|>\n"    << gc__chat_trim(msg->content) << "<|endofturn|>\n";
-            else if (role == "user")      ss << "<|user|>\n"      << gc__chat_trim(msg->content) << "<|endofturn|>\n";
-            else if (role == "assistant") ss << "<|assistant|>\n" << gc__chat_trim(msg->content) << "<|endofturn|>\n";
-            else if (role == "tool")      ss << "<|tool|>\n"      << gc__chat_trim(msg->content) << "<|endofturn|>\n";
-        }
-        if (add_ass) ss << "<|assistant|>\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_RWKV_WORLD) {
-        for (size_t i = 0; i < chat.size(); i++) {
-            std::string role(chat[i]->role);
-            if (role == "system") {
-                ss << "System: " << gc__chat_trim(chat[i]->content) << "\n\n";
-            } else if (role == "user") {
-                ss << "User: " << gc__chat_trim(chat[i]->content) << "\n\n";
-                if (i == chat.size() - 1) ss << "Assistant:";
-            } else if (role == "assistant") {
-                ss << "Assistant: " << gc__chat_trim(chat[i]->content) << "\n\n";
-            }
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_GRANITE_3_X) {
-        for (const auto & msg : chat) {
-            ss << "<|start_of_role|>" << msg->role << "<|end_of_role|>";
-            if (std::string(msg->role) == "assistant_tool_call") ss << "<|tool_call|>";
-            ss << msg->content << "<|end_of_text|>\n";
-        }
-        if (add_ass) ss << "<|start_of_role|>assistant<|end_of_role|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_GRANITE_4_0) {
-        for (const auto & msg : chat) {
-            if (std::string(msg->role) == "assistant_tool_call") {
-                ss << "<|start_of_role|>assistant<|end_of_role|><|tool_call|>";
-            } else {
-                ss << "<|start_of_role|>" << msg->role << "<|end_of_role|>";
-            }
-            ss << msg->content << "<|end_of_text|>\n";
-        }
-        if (add_ass) ss << "<|start_of_role|>assistant<|end_of_role|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_GIGACHAT) {
-        bool has_sys = !chat.empty() && std::string(chat[0]->role) == "system";
-        ss << (has_sys ? "<s>" + std::string(chat[0]->content) + "<|message_sep|>" : "<s>");
-        for (size_t i = has_sys ? 1 : 0; i < chat.size(); i++) {
-            std::string role(chat[i]->role);
-            if (role == "user") {
-                ss << "user<|role_sep|>" << chat[i]->content << "<|message_sep|>"
-                   << "available functions<|role_sep|>[]<|message_sep|>";
-            } else if (role == "assistant") {
-                ss << "assistant<|role_sep|>" << chat[i]->content << "<|message_sep|>";
-            }
-        }
-        if (add_ass) ss << "assistant<|role_sep|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_MEGREZ) {
-        for (auto msg : chat) {
-            ss << "<|role_start|>" << msg->role << "<|role_end|>" << msg->content << "<|turn_end|>";
-        }
-        if (add_ass) ss << "<|role_start|>assistant<|role_end|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_YANDEX) {
-        for (size_t i = 0; i < chat.size(); i++) {
-            std::string role(chat[i]->role);
-            if (role == "user")           ss << " Пользователь: " << chat[i]->content << "\n\n";
-            else if (role == "assistant") ss << " Ассистент: "    << chat[i]->content << "\n\n";
-        }
-        if (add_ass) ss << " Ассистент:[SEP]";
-    } else if (tmpl == GC_CHAT_TEMPLATE_BAILING || tmpl == GC_CHAT_TEMPLATE_BAILING_THINK) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "user") role = "HUMAN";
-            else std::transform(role.begin(), role.end(), role.begin(), ::toupper);
-            ss << "<role>" << role << "</role>" << msg->content;
-        }
-        if (add_ass) {
-            ss << "<role>ASSISTANT</role>";
-            if (tmpl == GC_CHAT_TEMPLATE_BAILING_THINK) ss << "<think>";
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_BAILING2) {
-        bool has_sys = !chat.empty() && std::string(chat[0]->role) == "system";
-        if (!has_sys) ss << "<role>SYSTEM</role>detailed thinking off<|role_end|>";
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "user") role = "HUMAN";
-            else std::transform(role.begin(), role.end(), role.begin(), ::toupper);
-            ss << "<role>" << role << "</role>" << msg->content << "<|role_end|>";
-        }
-        if (add_ass) ss << "<role>ASSISTANT</role>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_LLAMA4) {
-        for (auto msg : chat) {
-            ss << "<|header_start|>" << msg->role << "<|header_end|>\n\n"
-               << gc__chat_trim(msg->content) << "<|eot|>";
-        }
-        if (add_ass) ss << "<|header_start|>assistant<|header_end|>\n\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_SMOLVLM) {
-        ss << "<|im_start|>";
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << msg->content << "\n\n";
-            else if (role == "user")      ss << "User: " << msg->content << "<end_of_utterance>\n";
-            else                          ss << "Assistant: " << msg->content << "<end_of_utterance>\n";
-        }
-        if (add_ass) ss << "Assistant:";
-    } else if (tmpl == GC_CHAT_TEMPLATE_DOTS1) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << "<|system|>" << msg->content << "<|endofsystem|>";
-            else if (role == "user")      ss << "<|userprompt|>" << msg->content << "<|endofuserprompt|>";
-            else                          ss << "<|response|>" << msg->content << "<|endofresponse|>";
-        }
-        if (add_ass) ss << "<|response|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_HUNYUAN_MOE) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << "<|startoftext|>" << msg->content << "<|extra_4|>";
-            else if (role == "assistant") ss << msg->content << "<|eos|>";
-            else                          ss << "<|startoftext|>" << msg->content << "<|extra_0|>";
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_OPENAI_MOE) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            ss << "<|start|>" << role << "<|message|>" << msg->content;
-            ss << (role == "assistant" ? "<|return|>" : "<|end|>");
-        }
-        if (add_ass) ss << "<|start|>assistant";
-    } else if (tmpl == GC_CHAT_TEMPLATE_HUNYUAN_DENSE) {
-        for (size_t i = 0; i < chat.size(); i++) {
-            std::string role(chat[i]->role);
-            if (i == 0 && role == "system") {
-                ss << chat[i]->content << GCU8("<｜hy_place▁holder▁no▁3｜>");
-            }
-            if (role == "assistant")     ss << GCU8("<｜hy_Assistant｜>") << chat[i]->content << GCU8("<｜hy_place▁holder▁no▁2｜>");
-            else if (role == "user")     ss << GCU8("<｜hy_User｜>") << chat[i]->content << GCU8("<｜hy_Assistant｜>");
-        }
-    } else if (tmpl == GC_CHAT_TEMPLATE_HUNYUAN_OCR) {
-        ss << GCU8("<｜hy_begin▁of▁sentence｜>");
-        for (size_t i = 0; i < chat.size(); i++) {
-            std::string role(chat[i]->role);
-            if (i == 0 && role == "system") {
-                ss << chat[i]->content << GCU8("<｜hy_place▁holder▁no▁3｜>");
+    while (pos_ < src_.size()) {
+        if (peek() == '{' && pos_ + 1 < src_.size()) {
+            char n = src_[pos_ + 1];
+            if (n == '{') {  // {{
+                emit_text();
+                adv(); adv(); // {{ consumed
+                tokens.push_back(make(TokenType::VariableOpen));
+                in_text = false;
+                // Parse expression inside {{ }}
+                while (pos_ < src_.size()) {
+                    skip_ws();
+                    if (peek() == '}' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '}') {
+                        emit_text();  // will be empty
+                        adv(); adv();
+                        tokens.push_back(make(TokenType::VariableClose));
+                        in_text = true;
+                        text_start = pos_;
+                        break;
+                    }
+                    // Parse identifiers / operators / string literals
+                    if (isalpha(peek()) || peek() == '_') {
+                        size_t s = pos_;
+                        while (pos_ < src_.size() && (isalnum(peek()) || peek() == '_' || peek() == '.' || peek() == '[' || peek() == ']' || peek() == '0' || peek() == '1' || peek() == '2' || peek() == '3' || peek() == '4' || peek() == '5' || peek() == '6' || peek() == '7' || peek() == '8' || peek() == '9')) {
+                            // Check for [0-9] for indices like messages[0]
+                            if (peek() == '[') { adv(); continue; }
+                            if (peek() == ']') { adv(); continue; }
+                            if (peek() == '.') { adv(); continue; }
+                            if (isdigit(peek())) {
+                                // Check if we're inside brackets -- that's an index
+                                size_t back = pos_;
+                                adv();
+                                continue;
+                            }
+                            adv();
+                        }
+                        tokens.push_back(make(TokenType::Identifier, &src_[s], pos_ - s));
+                        skip_ws();
+                    } else if (peek() == '"' || peek() == '\'') {
+                        size_t s = pos_;
+                        char quote = adv();
+                        while (pos_ < src_.size() && peek() != quote) adv();
+                        adv();
+                        tokens.push_back(make(TokenType::String, &src_[s], pos_ - s));
+                        skip_ws();
+                        // Actually the string includes delimiters, which we need to strip later
+                    } else if (peek() == '|') {
+                        adv();
+                        tokens.push_back(make(TokenType::Pipe));
+                        skip_ws();
+                    } else if (peek() == ',') {
+                        adv();
+                        tokens.push_back(make(TokenType::Comma));
+                        skip_ws();
+                    } else if (peek() == '=' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '=') {
+                        adv(); adv();
+                        tokens.push_back(make(TokenType::Op, "=="));
+                        skip_ws();
+                    } else if (peek() == '!' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '=') {
+                        adv(); adv();
+                        tokens.push_back(make(TokenType::Op, "!="));
+                        skip_ws();
+                    } else if (peek() == '<' || peek() == '>') {
+                        char c = adv();
+                        if (peek() == '=') { adv(); tokens.push_back(make(TokenType::Op, std::string(1, c) + "=")); }
+                        else { tokens.push_back(make(TokenType::Op, std::string(1, c))); }
+                        skip_ws();
+                    } else if (peek() == '-' && pos_ + 1 < src_.size() && isdigit(src_[pos_ + 1])) {
+                        size_t s = pos_;
+                        adv(); // consume -
+                        while (pos_ < src_.size() && isdigit(peek())) adv();
+                        tokens.push_back(make(TokenType::Number, &src_[s], pos_ - s));
+                        skip_ws();
+                    } else if (isdigit(peek())) {
+                        size_t s = pos_;
+                        while (pos_ < src_.size() && isdigit(peek())) adv();
+                        tokens.push_back(make(TokenType::Number, &src_[s], pos_ - s));
+                        skip_ws();
+                    } else if (peek() == '(') {
+                        // skip parens for function calls — we only support simple variable lookups
+                        adv();
+                        skip_ws();
+                    } else if (peek() == ')') {
+                        adv();
+                        skip_ws();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            } else if (n == '%') {  // {%
+                emit_text();
+                adv(); adv();
+                tokens.push_back(make(TokenType::TagOpen));
+                in_text = false;
+                // Parse tag content
+                while (pos_ < src_.size()) {
+                    skip_ws();
+                    if (peek() == '%' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '}') {
+                        emit_text();
+                        adv(); adv();
+                        tokens.push_back(make(TokenType::TagClose));
+                        in_text = true;
+                        text_start = pos_;
+                        break;
+                    }
+                    if (isalpha(peek()) || peek() == '_') {
+                        size_t s = pos_;
+                        while (pos_ < src_.size() && (isalnum(peek()) || peek() == '_' || peek() == '.' || peek() == '[' || peek() == ']')) adv();
+                        tokens.push_back(make(TokenType::Identifier, &src_[s], pos_ - s));
+                        skip_ws();
+                    } else if (peek() == '"' || peek() == '\'') {
+                        size_t s = pos_;
+                        char quote = adv();
+                        while (pos_ < src_.size() && peek() != quote) adv();
+                        adv();
+                        tokens.push_back(make(TokenType::String, &src_[s], pos_ - s));
+                        skip_ws();
+                    } else if (peek() == '=' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '=') {
+                        adv(); adv();
+                        tokens.push_back(make(TokenType::Op, "=="));
+                        skip_ws();
+                    } else if (peek() == '!' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '=') {
+                        adv(); adv();
+                        tokens.push_back(make(TokenType::Op, "!="));
+                        skip_ws();
+                    } else if (peek() == '<' || peek() == '>') {
+                        char c = adv();
+                        if (peek() == '=') { adv(); tokens.push_back(make(TokenType::Op, std::string(1, c) + "=")); }
+                        else { tokens.push_back(make(TokenType::Op, std::string(1, c))); }
+                        skip_ws();
+                    } else if (peek() == ',') { adv(); tokens.push_back(make(TokenType::Comma)); skip_ws(); }
+                    else break;
+                }
+                continue;
+            } else if (n == '#') {  // {#
+                emit_text();
+                adv(); adv();
+                tokens.push_back(make(TokenType::CommentOpen));
+                in_text = false;
+                while (pos_ < src_.size()) {
+                    if (peek() == '#' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '}') {
+                        adv(); adv();
+                        tokens.push_back(make(TokenType::CommentClose));
+                        in_text = true;
+                        text_start = pos_;
+                        break;
+                    }
+                    adv();
+                }
                 continue;
             }
-            if (role == "user")           ss << chat[i]->content << GCU8("<｜hy_User｜>");
-            else if (role == "assistant") ss << chat[i]->content << GCU8("<｜hy_Assistant｜>");
         }
-    } else if (tmpl == GC_CHAT_TEMPLATE_KIMI_K2) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << "<|im_system|>system<|im_middle|>";
-            else if (role == "user")      ss << "<|im_user|>user<|im_middle|>";
-            else if (role == "assistant") ss << "<|im_assistant|>assistant<|im_middle|>";
-            else if (role == "tool")      ss << "<|im_system|>tool<|im_middle|>";
-            ss << msg->content << "<|im_end|>";
-        }
-        if (add_ass) ss << "<|im_assistant|>assistant<|im_middle|>";
-    } else if (tmpl == GC_CHAT_TEMPLATE_SEED_OSS) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            ss << "<seed:bos>" << role << "\n"
-               << (role == "assistant" ? gc__chat_trim(msg->content) : std::string(msg->content))
-               << "<seed:eos>";
-        }
-        if (add_ass) ss << "<seed:bos>assistant\n";
-    } else if (tmpl == GC_CHAT_TEMPLATE_GROK_2) {
-        for (auto msg : chat) {
-            std::string role(msg->role);
-            if (role == "system")         ss << "System: "    << gc__chat_trim(msg->content) << "<|separator|>\n\n";
-            else if (role == "user")      ss << "Human: "     << gc__chat_trim(msg->content) << "<|separator|>\n\n";
-            else if (role == "assistant") ss << "Assistant: " << msg->content                << "<|separator|>\n\n";
-        }
-        if (add_ass) ss << "Assistant:";
-    } else if (tmpl == GC_CHAT_TEMPLATE_PANGU_EMBED) {
-        for (size_t i = 0; i < chat.size(); ++i) {
-            const std::string role(chat[i]->role), content(chat[i]->content);
-            if (i == 0 && role != "system") ss << GCU8("[unused9]系统：[unused10]");
-            if (role == "system")           ss << GCU8("[unused9]系统：") << content << GCU8("[unused10]");
-            else if (role == "user")        ss << GCU8("[unused9]用户：") << content << GCU8("[unused10]");
-            else if (role == "assistant")   ss << GCU8("[unused9]助手：") << content << GCU8("[unused10]");
-            else if (role == "tool")        ss << GCU8("[unused9]工具：") << content << GCU8("[unused10]");
-            else if (role == "function")    ss << GCU8("[unused9]方法：") << content << GCU8("[unused10]");
-        }
-        if (add_ass) ss << GCU8("[unused9]助手：");
-    } else if (tmpl == GC_CHAT_TEMPLATE_SOLAR_OPEN) {
-        for (auto msg : chat) {
-            ss << "<|begin|>" << msg->role << "<|content|>" << msg->content << "<|end|>";
-        }
-        if (add_ass) ss << "<|begin|>assistant";
-    } else {
-        return -1;
+        adv();
     }
-
-    dest = ss.str();
-    return (int32_t)dest.size();
+    if (in_text) {
+        emit_text();
+    }
+    tokens.push_back(make(TokenType::Eof));
+    return tokens;
 }
 
-int32_t gc_chat_builtin_templates(const char ** output, size_t len) {
-    auto it = GC_CHAT_TEMPLATES.begin();
-    for (size_t i = 0; i < std::min(len, GC_CHAT_TEMPLATES.size()); i++) {
-        output[i] = it->first.c_str();
-        std::advance(it, 1);
+void Lexer::error(const std::string & msg) {
+    GC_LOG_ERR("Lexer error at line %d: %s", line_, msg.c_str());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class Parser {
+public:
+    Parser(const std::vector<Token> & tokens, std::string & err)
+        : tokens_(tokens), pos_(0), err_(err) {}
+
+    AstRoot parse();
+
+private:
+    const std::vector<Token> & tokens_;
+    size_t                    pos_;
+    std::string &             err_;
+
+    const Token & peek() const { return pos_ < tokens_.size() ? tokens_[pos_] : tokens_.back(); }
+    const Token & adv()        { return tokens_[pos_++]; }
+
+    bool accept(TokenType t) {
+        if (peek().type == t) { adv(); return true; }
+        return false;
     }
-    return (int32_t)GC_CHAT_TEMPLATES.size();
+
+    bool expect(TokenType t, const std::string & ctx) {
+        if (peek().type != t) {
+            err_ = std::string("Expected ") + std::to_string((int)t) + " at pos " + std::to_string(peek().pos) + " in " + ctx;
+            return false;
+        }
+        adv();
+        return true;
+    }
+
+    void skip_eof() {
+        while (pos_ < tokens_.size() && peek().type != TokenType::Eof) {
+            if (peek().type == TokenType::Text) { adv(); continue; }
+            if (peek().type == TokenType::CommentClose) { adv(); continue; }
+            break;
+        }
+        adv(); // Eof
+    }
+};
+
+AstRoot Parser::parse() {
+    AstRoot root;
+    std::vector<AstNode> * current = &root.nodes;
+    std::stack<std::vector<AstNode> *> stack;
+    stack.push(current);
+
+    auto err_if = [&](bool cond, const std::string & msg) {
+        if (cond) { err_ = msg; }
+    };
+
+    while (pos_ < tokens_.size()) {
+        const Token & t = peek();
+        if (t.type == TokenType::Eof) break;
+
+        if (t.type == TokenType::Text) {
+            AstNode n;
+            n.kind  = AstNode::kText;
+            n.text  = t.value;
+            stack.top()->push_back(n);
+            adv();
+            continue;
+        }
+
+        if (t.type == TokenType::CommentOpen) {
+            while (pos_ < tokens_.size() && peek().type != TokenType::CommentClose) adv();
+            if (pos_ < tokens_.size()) adv(); // consume CommentClose
+            continue;
+        }
+
+        if (t.type == TokenType::VariableOpen) {
+            adv(); // consume {{
+            AstNode n;
+            n.kind = AstNode::kExpr;
+
+            // Parse variable expression
+            std::string var;
+            while (pos_ < tokens_.size()) {
+                const Token & in = peek();
+                if (in.type == TokenType::Identifier) {
+                    var += in.value;
+                    adv();
+                } else if (in.type == TokenType::Pipe) {
+                    // Start filter chain
+                    adv();
+                    // Collect filters
+                    while (pos_ < tokens_.size() && peek().type == TokenType::Identifier) {
+                        n.filters.push_back(peek().value);
+                        adv();
+                        // Check for next pipe
+                        if (pos_ < tokens_.size() && peek().type == TokenType::Pipe) {
+                            adv();
+                        } else {
+                            break;
+                        }
+                    }
+                    // After filters, expect VariableClose
+                    if (pos_ < tokens_.size() && peek().type == TokenType::VariableClose) {
+                        adv();
+                        break;
+                    }
+                } else if (in.type == TokenType::VariableClose) {
+                    adv();
+                    break;
+                } else {
+                    break;
+                }
+            }
+            n.expr_var = var;
+            stack.top()->push_back(n);
+            continue;
+        }
+
+        if (t.type == TokenType::TagOpen) {
+            adv(); // consume {%
+            // Read the keyword: if, for, else, endif, endfor, set
+            std::string keyword;
+            if (pos_ < tokens_.size() && peek().type == TokenType::Identifier) {
+                keyword = peek().value;
+                adv();
+            }
+
+            if (keyword == "if") {
+                AstNode n;
+                n.kind = AstNode::kIf;
+                // Read condition variable
+                if (pos_ < tokens_.size() && tokens_[pos_].type == TokenType::Identifier) {
+                    n.cond_var = tokens_[pos_].value;
+                    adv();
+                }
+                // Read comparison operator and value if present
+                if (pos_ < tokens_.size() && tokens_[pos_].type == TokenType::Op) {
+                    // For now, simplified: if var is truthy/falsy
+                }
+                // Expect TagClose
+                if (pos_ < tokens_.size() && peek().type == TokenType::TagClose) {
+                    adv();
+                }
+                // Push if block
+                stack.top()->push_back(n);
+                // Create a new level for if body
+                std::vector<AstNode> body;
+                stack.push(&stack.top()->back().children);
+                continue;
+            }
+
+            if (keyword == "else") {
+                // Pop current level, create else branch
+                stack.pop();
+                // Add else node to parent (the if)
+                AstNode else_node;
+                else_node.kind = AstNode::kElse;
+                // We need to find the if node in the parent and add else there
+                if (!stack.empty()) {
+                    auto & parent = *stack.top();
+                    if (!parent.empty() && parent.back().kind == AstNode::kIf) {
+                        parent.back().children.push_back(else_node);
+                        // Push else body level
+                        std::vector<AstNode> else_body;
+                        stack.push(&parent.back().children);
+                    }
+                }
+                // Expect TagClose
+                if (pos_ < tokens_.size() && peek().type == TokenType::TagClose) adv();
+                continue;
+            }
+
+            if (keyword == "endif") {
+                // Pop if body level
+                if (stack.size() > 1) stack.pop();
+                if (pos_ < tokens_.size() && peek().type == TokenType::TagClose) adv();
+                continue;
+            }
+
+            if (keyword == "for") {
+                AstNode n;
+                n.kind = AstNode::kFor;
+                // Read loop_var
+                if (pos_ < tokens_.size() && tokens_[pos_].type == TokenType::Identifier) {
+                    n.loop_var = tokens_[pos_].value;
+                    adv();
+                }
+                // Expect comma or "in"
+                // Skip to the "in" keyword
+                while (pos_ < tokens_.size() && peek().type != TokenType::Identifier) adv();
+                // After "in", the iterable
+                if (pos_ < tokens_.size() && tokens_[pos_].type == TokenType::Identifier) {
+                    // Could be "messages" or similar
+                    // For now, look for identifier that is the collection
+                    if (tokens_[pos_].value != "for" && tokens_[pos_].value != "in") {
+                        // It's the iterable name but we keep it in the node
+                        n.loop_iter = tokens_[pos_].value;
+                        adv();
+                    }
+                }
+                // Check for comma-separated parts (messages[0].role etc.)
+                while (pos_ < tokens_.size() && peek().type == TokenType::Comma) {
+                    adv();
+                    // Skip extra identifiers
+                    while (pos_ < tokens_.size() && peek().type == TokenType::Identifier) adv();
+                }
+                // Expect TagClose
+                if (pos_ < tokens_.size() && peek().type == TokenType::TagClose) adv();
+                // Push for body level
+                stack.top()->push_back(n);
+                std::vector<AstNode> body;
+                stack.push(&stack.top()->back().children);
+                continue;
+            }
+
+            if (keyword == "endfor") {
+                if (stack.size() > 1) stack.pop();
+                if (pos_ < tokens_.size() && peek().type == TokenType::TagClose) adv();
+                continue;
+            }
+
+            if (keyword == "set") {
+                AstNode n;
+                n.kind = AstNode::kSet;
+                // Read variable name
+                if (pos_ < tokens_.size() && tokens_[pos_].type == TokenType::Identifier) {
+                    n.set_var = tokens_[pos_].value;
+                    adv();
+                }
+                // Expect =
+                if (pos_ < tokens_.size() && peek().type == TokenType::Op && peek().value == "=") {
+                    adv();
+                }
+                // Read expression
+                std::string expr;
+                while (pos_ < tokens_.size() && peek().type != TokenType::TagClose) {
+                    expr += peek().value + " ";
+                    adv();
+                }
+                n.set_expr = expr;
+                if (pos_ < tokens_.size() && peek().type == TokenType::TagClose) adv();
+                stack.top()->push_back(n);
+                continue;
+            }
+
+            // Unknown tag — fail loudly per spec
+            err_ = "Unknown template tag at position " + std::to_string(t.pos);
+            continue;
+        }
+
+        // Unknown token — skip
+        adv();
+    }
+
+    return root;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  RENDERER (EVALUATOR)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct ChatContext {
+    // messages array
+    std::vector<std::string> roles;
+    std::vector<std::string> contents;
+
+    // System message
+    std::string system;
+
+    // Loop iteration state
+    struct LoopVar {
+        std::string value;
+        int         index = 0;
+        bool        first = false;
+        bool        last  = false;
+    };
+    std::map<std::string, LoopVar> loop_vars;
+
+    // Set variables
+    std::map<std::string, std::string> vars;
+
+    // Get a value by path expression (simplified: only var name or messages[i].field)
+    std::string resolve(const std::string & expr) const {
+        // Simple variable
+        auto it = vars.find(expr);
+        if (it != vars.end()) return it->second;
+
+        // Loop variable
+        auto lit = loop_vars.find(expr);
+        if (lit != loop_vars.end()) return lit->second.value;
+
+        // messages[N].role or messages[N].content
+        if (expr.find("messages[") == 0) {
+            size_t brk = expr.find(']');
+            if (brk != std::string::npos) {
+                std::string idx_str = expr.substr(9, brk - 9);
+                int idx = 0;
+                try { idx = std::stoi(idx_str); } catch (...) {}
+                std::string field = expr.substr(brk + 2); // skip ]. and field
+                if (idx >= 0 && (size_t)idx < roles.size()) {
+                    if (field == "role") return roles[idx];
+                    if (field == "content") return contents[idx];
+                }
+            }
+        }
+
+        // messages[N] (whole message as string)
+        if (expr.find("messages[") == 0) {
+            size_t brk = expr.find(']');
+            if (brk != std::string::npos) {
+                std::string idx_str = expr.substr(9, brk - 9);
+                int idx = 0;
+                try { idx = std::stoi(idx_str); } catch (...) {}
+                if (idx >= 0 && (size_t)idx < roles.size()) {
+                    return roles[idx] + ": " + contents[idx];
+                }
+            }
+        }
+
+        // "messages" as an array — not supported, just return count
+        if (expr == "messages") return std::to_string(roles.size());
+
+        // "system"
+        if (expr == "system") return system;
+
+        return "";
+    }
+};
+
+// Apply filters
+static std::string apply_filter(const std::string & value, const std::string & filter) {
+    if (filter == "strip") {
+        size_t s = 0, e = value.size();
+        while (s < e && isspace((unsigned char)value[s])) s++;
+        while (e > s && isspace((unsigned char)value[e-1])) e--;
+        return value.substr(s, e - s);
+    }
+    if (filter == "upper") {
+        std::string r = value;
+        for (char & c : r) c = toupper((unsigned char)c);
+        return r;
+    }
+    if (filter == "lower") {
+        std::string r = value;
+        for (char & c : r) c = tolower((unsigned char)c);
+        return r;
+    }
+    if (filter == "title") {
+        std::string r = value;
+        bool cap = true;
+        for (char & c : r) {
+            if (isspace((unsigned char)c)) { cap = true; continue; }
+            if (cap) c = toupper((unsigned char)c); cap = false;
+        }
+        return r;
+    }
+    if (filter == "length") {
+        return std::to_string(value.size());
+    }
+    // Unknown filter — return as-is
+    return value;
+}
+
+// Render an AST node to output string
+static void render_node(const AstNode & node, ChatContext & ctx, std::string & out) {
+    switch (node.kind) {
+        case AstNode::kText:
+            out += node.text;
+            break;
+
+        case AstNode::kExpr: {
+            std::string val = ctx.resolve(node.expr_var);
+            for (const auto & f : node.filters) {
+                val = apply_filter(val, f);
+            }
+            out += val;
+            break;
+        }
+
+        case AstNode::kIf: {
+            // Evaluate condition: variable truthiness
+            std::string cond_val = ctx.resolve(node.cond_var);
+            bool truthy = !cond_val.empty() && cond_val != "0" && cond_val != "false";
+            // Check if there's an else branch
+            bool has_else = false;
+            size_t else_idx = 0;
+            for (size_t i = 0; i < node.children.size(); i++) {
+                if (node.children[i].kind == AstNode::kElse) {
+                    has_else = true;
+                    else_idx = i;
+                    break;
+                }
+            }
+            if (truthy) {
+                // Render children up to else
+                for (size_t i = 0; i < node.children.size(); i++) {
+                    if (node.children[i].kind == AstNode::kElse) break;
+                    render_node(node.children[i], ctx, out);
+                }
+            } else if (has_else) {
+                // Render after else
+                for (size_t i = else_idx + 1; i < node.children.size(); i++) {
+                    render_node(node.children[i], ctx, out);
+                }
+            }
+            break;
+        }
+
+        case AstNode::kElse:
+            // Handled by kIf above
+            break;
+
+        case AstNode::kFor: {
+            // Iterate over "messages" or provided collection
+            std::string collection = ctx.resolve(node.loop_iter);
+            // If the iterable is "messages", iterate over roles/contents
+            if (node.loop_iter == "messages") {
+                for (size_t i = 0; i < ctx.roles.size(); i++) {
+                    ChatContext::LoopVar lv;
+                    lv.value  = ctx.roles[i] + ": " + ctx.contents[i];
+                    lv.index  = i;
+                    lv.first  = (i == 0);
+                    lv.last   = (i == ctx.roles.size() - 1);
+                    ctx.loop_vars[node.loop_var] = lv;
+
+                    // Also populate "role" and "content" loop vars
+                    ChatContext::LoopVar role_lv, content_lv;
+                    role_lv.value     = ctx.roles[i];
+                    role_lv.index     = i;
+                    role_lv.first     = (i == 0);
+                    role_lv.last      = (i == ctx.roles.size() - 1);
+                    content_lv.value  = ctx.contents[i];
+                    content_lv.index  = i;
+                    content_lv.first  = (i == 0);
+                    content_lv.last   = (i == ctx.roles.size() - 1);
+                    ctx.loop_vars[node.loop_var + ".role"] = role_lv;
+                    ctx.loop_vars[node.loop_var + ".content"] = content_lv;
+
+                    for (const auto & child : node.children) {
+                        render_node(child, ctx, out);
+                    }
+                }
+            }
+            break;
+        }
+
+        case AstNode::kSet: {
+            std::string val = ctx.resolve(node.set_expr);
+            ctx.vars[node.set_var] = val;
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PUBLIC API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct gc_chat_template_t {
+    AstRoot            ast;
+    std::string        compile_error;
+    std::string        raw_template;
+};
+
+gc_status_t gc_chat_create(gc_chat_template_t ** out) {
+    *out = new gc_chat_template_t{};
+    return *out ? GC_OK : GC_ERR_ALLOC;
+}
+
+void gc_chat_free(gc_chat_template_t * t) {
+    delete t;
+}
+
+gc_status_t gc_chat_compile(gc_chat_template_t * t, const char * template_str) {
+    if (!t || !template_str) return GC_ERR_INVALID;
+    t->raw_template = template_str;
+    t->compile_error.clear();
+
+    Lexer lexer(template_str);
+    auto tokens = lexer.tokenize();
+
+    t->compile_error.clear();
+    Parser parser(tokens, t->compile_error);
+    t->ast = parser.parse();
+
+    if (!t->compile_error.empty()) {
+        return GC_ERR_UNSUPPORTED;
+    }
+    return GC_OK;
+}
+
+gc_status_t gc_chat_render(gc_chat_template_t * t,
+                           const char * const * roles,
+                           const char * const * contents,
+                           size_t n_messages,
+                           const char * system,
+                           bool add_ass,
+                           std::string * out) {
+    if (!t || !out) return GC_ERR_INVALID;
+
+    ChatContext ctx;
+    for (size_t i = 0; i < n_messages; i++) {
+        ctx.roles.push_back(roles[i] ? roles[i] : "");
+        ctx.contents.push_back(contents[i] ? contents[i] : "");
+    }
+    ctx.system = system ? system : "";
+
+    out->clear();
+    for (const auto & node : t->ast.nodes) {
+        render_node(node, ctx, *out);
+    }
+
+    // If add_ass, append assistant start
+    if (add_ass) {
+        // Detect expected assistant prefix from template (simple heuristic)
+        if (t->raw_template.find("<|im_start|>assistant") != std::string::npos)
+            *out += "<|im_start|>assistant\n";
+        else if (t->raw_template.find("<|start_header_id|>assistant") != std::string::npos)
+            *out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        else if (t->raw_template.find("[INST]") != std::string::npos && t->raw_template.find("[/INST]") != std::string::npos)
+            *out += " [/INST]";
+        else if (t->raw_template.find("ASSISTANT:") != std::string::npos)
+            *out += "ASSISTANT:";
+        else if (t->raw_template.find("model") != std::string::npos && t->raw_template.find("<|end_of_turn|>") != std::string::npos)
+            *out += "<|start_of_turn|>model\n";
+        else
+            *out += "assistant\n";
+    }
+
+    return GC_OK;
+}
+
+gc_status_t gc_chat_apply(const char * template_str,
+                          const char * const * roles,
+                          const char * const * contents,
+                          size_t n_messages,
+                          std::string * out) {
+    // Use a default ChatML template if none provided
+    if (!template_str) template_str = "{% for msg in messages %}<|im_start|>{{ msg.role }}\n{{ msg.content | strip }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n";
+
+    gc_chat_template_t * t = nullptr;
+    gc_status_t st = gc_chat_create(&t);
+    if (st != GC_OK) return st;
+
+    st = gc_chat_compile(t, template_str);
+    if (st != GC_OK) { gc_chat_free(t); return st; }
+
+    st = gc_chat_render(t, roles, contents, n_messages, "", false, out);
+    gc_chat_free(t);
+    return st;
+}
+
+const char * gc_chat_error(gc_chat_template_t * t) {
+    return t ? t->compile_error.c_str() : "null template";
 }
