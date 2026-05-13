@@ -5,6 +5,8 @@
 #include "gc_hparams.h"
 #include "gc_arch_runtime.h"
 
+class GcGraphBuilder;  // forward decl — actual interface in src/graph/gc_graph.h
+
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -157,6 +159,9 @@ private:
     // ── Persistent KV pool ────────────────────────────────────────────────────
     gc_kv_pool_t kv_pool_;
 
+    // ── Architecture-specific graph builder ──────────────────────────────────
+    std::unique_ptr<GcGraphBuilder> graph_builder_;
+
     // ── Static input tensors (CPU-backed, reused each step) ──────────────────
     // Avoids per-step malloc for the input ids and position ids.
     ggml_context *        inp_ctx_ = nullptr;
@@ -166,15 +171,10 @@ private:
 
     int max_inp_tokens_ = 0;  // current capacity of inp_tokens_ / inp_pos_
 
-    // ── Cached weight pointers ────────────────────────────────────────────────
+    // ── Cached weight pointers (used by init validation, not by graph builder) ─
     const gc_tensor_weight_t * w_tok_embd_    = nullptr;
     const gc_tensor_weight_t * w_output_      = nullptr;
     const gc_tensor_weight_t * w_output_norm_ = nullptr;
-
-    // ── Arch params (computed once in init) ──────────────────────────────────
-    gc_norm_params_t norm_params_{};
-    gc_ffn_params_t  ffn_params_{};
-    gc_rope_params_t rope_params_{};
 
     // ── Per-request sampling state ────────────────────────────────────────────
     struct req_state_t {
@@ -199,24 +199,12 @@ private:
     void destroy();
     bool ensure_inp_capacity(int n_tokens);
 
-    // ── Graph builder ─────────────────────────────────────────────────────────
-    // Build the full forward graph for one request.
-    // Returns the logits tensor (output, F32 [vocab_size, n_new]).
-    // All tensors are no_alloc; allocation is deferred to galloc_.
-    // *kq_mask_out receives the causal mask tensor so execute() can populate it
-    // after ggml_gallocr_alloc_graph (that is when the tensor gets a buffer).
+    // ── Graph building via arch-specific builder ─────────────────────────────
+    // Delegates to graph_builder_->build().
     ggml_tensor * build_graph(ggml_context * ctx,
                               ggml_cgraph  * gf,
                               const gc_batch_entry_t & e,
                               ggml_tensor ** kq_mask_out);
-
-    // ── Weight view ───────────────────────────────────────────────────────────
-    const gc_tensor_weight_t * find_w(gc_tensor_role_t role,
-                                      const char * suffix,
-                                      int layer = -1) const;
-
-    ggml_tensor * weight_view(ggml_context * ctx,
-                              const gc_tensor_weight_t * w) const;
 
     // ── Sampling ──────────────────────────────────────────────────────────────
     void    apply_rep_penalty(std::vector<float> & logits,

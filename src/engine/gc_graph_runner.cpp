@@ -1,4 +1,6 @@
 #include "gc_graph_runner.h"
+#include "gc_graph.h"
+#include "gc_graph_llama.h"
 #include "gc_debug.h"
 
 #include "gc_arch.h"
@@ -128,17 +130,20 @@ bool gc_graph_runner_t::init() {
     if (!gc_arch_runtime_validate_hparams(hp_, &err)) {
         err_ = "hparams: " + err; return false;
     }
-    if (!gc_arch_runtime_build_norm_params(hp_, norm_params_, &err)) {
-        err_ = "norm params: " + err; return false;
-    }
-    if (!gc_arch_runtime_build_ffn_params(hp_, ffn_params_, &err)) {
-        err_ = "ffn params: " + err; return false;
-    }
-    if (!gc_arch_runtime_build_rope_params(hp_, rope_params_, &err)) {
-        err_ = "rope params: " + err; return false;
-    }
-
     const gc_arch_t arch = hp_.arch;
+
+    // ── Create architecture-specific graph builder ───────────────────────────
+    switch (arch) {
+        case GC_ARCH_LLAMA:
+        case GC_ARCH_LLAMA4:
+            graph_builder_ = std::make_unique<GcGraphLlama>();
+            break;
+        default:
+            graph_builder_ = std::make_unique<GcGraphLlama>();
+            fprintf(stderr, "[gc_graph_runner] arch %s (%d) using default Llama builder\n",
+                    gc_arch_name(arch), (int)arch);
+            break;
+    }
     w_tok_embd_ = loader_->find_weight(gc_tn(arch, GC_TENSOR_TOKEN_EMBD, "weight").c_str());
     w_output_   = loader_->find_weight(gc_tn(arch, GC_TENSOR_OUTPUT,     "weight").c_str());
     if (!w_tok_embd_) { err_ = "missing token_embd.weight"; return false; }
@@ -238,352 +243,60 @@ bool gc_graph_runner_t::ensure_inp_capacity(int n_tokens) {
     return true;
 }
 
-// ── weight_view() ─────────────────────────────────────────────────────────────
-// Zero-copy view into mmap'd weight data. The tensor is marked no_alloc;
-// its data pointer points directly into the mmap region.
-
-ggml_tensor * gc_graph_runner_t::weight_view(ggml_context * ctx,
-                                               const gc_tensor_weight_t * w) const {
-    if (!ctx || !w || !w->tensor) return nullptr;
-    const int64_t ne0 = w->tensor->ne[0];
-    const int64_t ne1 = w->tensor->ne[1];
-    const bool prev = ggml_get_no_alloc(ctx);
-    ggml_set_no_alloc(ctx, true);
-    ggml_tensor * t = ggml_new_tensor_2d(ctx, w->tensor->type, ne0, ne1);
-    ggml_set_no_alloc(ctx, prev);
-    if (!t) return nullptr;
-    const auto & mm = loader_->mmaps[(size_t)w->shard_idx];
-    if (!mm) return nullptr;
-    t->data = static_cast<uint8_t *>(mm->addr()) + w->file_offs;
-    return t;
-}
-
-const gc_tensor_weight_t * gc_graph_runner_t::find_w(gc_tensor_role_t role,
-                                                       const char * suffix,
-                                                       int layer) const {
-    if (!loader_) return nullptr;
-    const std::string name = (layer >= 0)
-        ? gc_tn(hp_.arch, role, suffix, layer)
-        : gc_tn(hp_.arch, role, suffix);
-    return loader_->find_weight(name.c_str());
-}
-
 // ── build_graph() ─────────────────────────────────────────────────────────────
-// Build the complete forward pass for one batch entry as a single ggml_cgraph.
-//
-// KV write path (no CPU copy):
-//   Kcur/Vcur are computed as graph nodes.
-//   For each new token i, we build a ggml_cpy into a ggml_view_1d of k_[il] at
-//   the physical slot for that token. These become graph nodes — the copy stays
-//   on-device.
-//
-// KV read path (zero copy):
-//   We build a contiguous VIEW of k_[il] and v_[il] covering exactly the slots
-//   for [0, n_ctx). Since the block table maps logical→physical, consecutive
-//   logical tokens may be in non-consecutive physical slots.
-//
-//   For decode (n_new=1): we read exactly n_ctx slots starting at slot 0.
-//   Because slots are physically scattered across blocks, we cannot use a single
-//   2D view in general. Instead we gather each slot into a fresh tensor via
-//   ggml_cpy — this IS a KV read copy, but it's a graph node (on-device) not
-//   a CPU memcpy.
-//
-//   FUTURE: Replace gather with a paged-attention GGML op (custom kernel) that
-//   reads directly from the block table without any copy.
-//
-// Instrumentation assertions:
-//   - GC_ASSERT_NO_CPU_KV: fires if backend is GPU and we detect a fallback path
-//   - Weight tensors: mmap-backed, not copied (CPU reads from disk/mmap as needed)
+// Delegates to the architecture-specific graph builder.
+// Owns weight view creation and input tensor wiring.
 
 ggml_tensor * gc_graph_runner_t::build_graph(ggml_context * ctx,
                                                ggml_cgraph  * gf,
                                                const gc_batch_entry_t & e,
                                                ggml_tensor ** kq_mask_out) {
     const int n_new = (int)e.token_ids.size();
-    const int n_ctx = e.num_computed + n_new;
-    const gc_graph_cb_t cb = [](ggml_tensor *, const char *, int) {};
 
-    // ── Inputs (reuse pre-allocated CPU tensors, write data) ─────────────────
-    // inp_tokens_ and inp_pos_ are backed by inp_buf_ (CPU, pre-allocated).
-    // ggml_backend_tensor_set is safe here — buffer is already set.
+    // Write input token IDs and positions into the pre-allocated CPU buffers.
     ggml_backend_tensor_set(inp_tokens_, e.token_ids.data(),
                              0, sizeof(int32_t) * (size_t)n_new);
     ggml_backend_tensor_set(inp_pos_,    e.position_ids.data(),
                              0, sizeof(int32_t) * (size_t)n_new);
 
-    // Build sub-views of the correct length for this step.
-    ggml_tensor * tok_t = ggml_view_1d(ctx, inp_tokens_, (int64_t)n_new, 0);
-    ggml_tensor * pos_t = ggml_view_1d(ctx, inp_pos_,    (int64_t)n_new, 0);
+    // Weight lookup lambda that creates mmap-backed views.
+    auto get_weight = [&](ggml_context * wctx, gc_tensor_role_t role,
+                          const char * suffix, int layer) -> ggml_tensor * {
+        const std::string name = (layer >= 0)
+            ? gc_tn(hp_.arch, role, suffix, layer)
+            : gc_tn(hp_.arch, role, suffix);
+        const gc_tensor_weight_t * w = loader_->find_weight(name.c_str());
+        if (!w || !w->tensor) return nullptr;
+        const int64_t ne0 = w->tensor->ne[0];
+        const int64_t ne1 = w->tensor->ne[1];
+        const bool prev = ggml_get_no_alloc(wctx);
+        ggml_set_no_alloc(wctx, true);
+        ggml_tensor * t = ggml_new_tensor_2d(wctx, w->tensor->type, ne0, ne1);
+        ggml_set_no_alloc(wctx, prev);
+        if (!t) return nullptr;
+        const auto & mm = loader_->mmaps[(size_t)w->shard_idx];
+        if (!mm) return nullptr;
+        t->data = static_cast<uint8_t *>(mm->addr()) + w->file_offs;
+        return t;
+    };
 
-    // ── Token embedding ───────────────────────────────────────────────────────
-    ggml_tensor * w_embd = weight_view(ctx, w_tok_embd_);
-    if (!w_embd) return nullptr;
-
-    ggml_tensor * cur = ggml_get_rows(ctx, w_embd, tok_t);
-    // cur: F32 [n_embd, n_new]  (dequantized by ggml_get_rows if quantized)
-
-    // ── Causal mask ───────────────────────────────────────────────────────────
-    // Allocated inside the no_alloc graph context — gallocr will back it.
-    // We mark it as input so gallocr keeps it non-overlapping and writable.
-    // Data is written by execute() AFTER ggml_gallocr_alloc_graph gives it a buffer.
-    ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
-                                                (int64_t)n_ctx, (int64_t)n_new);
-    ggml_set_name(kq_mask, "kq_mask");
-    ggml_set_input(kq_mask);
-    if (kq_mask_out) *kq_mask_out = kq_mask;
-
-    // ── Transformer layers ────────────────────────────────────────────────────
-    for (uint32_t il = 0; il < hp_.n_layer; ++il) {
-        std::string lerr;
-        gc_attn_params_t ap{};
-        gc_layer_flags_t lf{};
-        if (!gc_arch_runtime_build_attn_params(hp_, il, (uint32_t)n_new, ap, &lerr) ||
-            !gc_arch_runtime_build_layer_flags(hp_, il, lf, &lerr)) {
-            err_ = lerr; return nullptr;
-        }
-
-        const int64_t n_embd_hq = ap.n_embd_head_q;
-        const int64_t n_embd_hv = ap.n_embd_head_v;
-        const int64_t nq        = ap.n_head_q;
-        const int64_t nkv       = ap.n_head_kv;
-
-        // ── Pre-attention norm ────────────────────────────────────────────────
-        ggml_tensor * w_an = weight_view(ctx, find_w(GC_TENSOR_ATTN_NORM, "weight", (int)il));
-        if (!w_an) { err_ = "missing attn_norm weight"; return nullptr; }
-        ggml_tensor * normed_attn = gc_build_norm(ctx, cur, w_an, nullptr,
-                                                   norm_params_.type, norm_params_.eps, cb, (int)il);
-
-        // ── Q/K/V projections ─────────────────────────────────────────────────
-        ggml_tensor * w_q = weight_view(ctx, find_w(GC_TENSOR_ATTN_Q, "weight", (int)il));
-        ggml_tensor * w_k = weight_view(ctx, find_w(GC_TENSOR_ATTN_K, "weight", (int)il));
-        ggml_tensor * w_v = weight_view(ctx, find_w(GC_TENSOR_ATTN_V, "weight", (int)il));
-        if (!w_q || !w_k || !w_v) { err_ = "missing attn QKV weight"; return nullptr; }
-
-        ggml_tensor * Qcur = ggml_reshape_3d(ctx,
-            ggml_mul_mat(ctx, w_q, normed_attn), n_embd_hq, nq, (int64_t)n_new);
-        ggml_tensor * Kcur = ggml_reshape_3d(ctx,
-            ggml_mul_mat(ctx, w_k, normed_attn), n_embd_hq, nkv, (int64_t)n_new);
-        ggml_tensor * Vcur = ggml_reshape_3d(ctx,
-            ggml_mul_mat(ctx, w_v, normed_attn), n_embd_hv, nkv, (int64_t)n_new);
-
-        if (lf.has_attn_q_norm) {
-            ggml_tensor * w_qn = weight_view(ctx, find_w(GC_TENSOR_ATTN_Q_NORM, "weight", (int)il));
-            if (w_qn) {
-                Qcur = ggml_reshape_3d(ctx,
-                    gc_build_norm(ctx,
-                        ggml_reshape_2d(ctx, Qcur, n_embd_hq, nq * (int64_t)n_new),
-                        w_qn, nullptr, norm_params_.type, norm_params_.eps, cb, (int)il),
-                    n_embd_hq, nq, (int64_t)n_new);
-            }
-        }
-        if (lf.has_attn_k_norm) {
-            ggml_tensor * w_kn = weight_view(ctx, find_w(GC_TENSOR_ATTN_K_NORM, "weight", (int)il));
-            if (w_kn) {
-                Kcur = ggml_reshape_3d(ctx,
-                    gc_build_norm(ctx,
-                        ggml_reshape_2d(ctx, Kcur, n_embd_hq, nkv * (int64_t)n_new),
-                        w_kn, nullptr, norm_params_.type, norm_params_.eps, cb, (int)il),
-                    n_embd_hq, nkv, (int64_t)n_new);
-            }
-        }
-
-        // ── RoPE ──────────────────────────────────────────────────────────────
-        if (lf.apply_rope && rope_params_.n_dims > 0) {
-            Qcur = gc_rope_apply(ctx, Qcur, pos_t, nullptr, rope_params_);
-            Kcur = gc_rope_apply(ctx, Kcur, pos_t, nullptr, rope_params_);
-        }
-
-        // ── KV write (on-device, graph node) ─────────────────────────────────
-        // For each new token i, compute the physical slot index and write K/V
-        // via ggml_cpy into the persistent KV pool tensor.
-        //
-        // Kcur shape: [n_embd_hq, nkv, n_new]
-        // We contiguously store K as [n_kv_head * head_dim] per slot row.
-        //
-        // To write token i: extract row i from Kcur (reshape to [row_size, n_new]),
-        // copy into kv_pool_.k[il] column at physical slot index.
-        //
-        // For n_new > 1 (prefill): we write each slot individually.
-        // FUTURE: A scatter kernel would write all n_new tokens in one op.
-
-        ggml_tensor * Kcur_2d = ggml_reshape_2d(ctx, Kcur,
-            (int64_t)(nkv * n_embd_hq), (int64_t)n_new);   // [row_size, n_new]
-        ggml_tensor * Vcur_2d = ggml_reshape_2d(ctx, Vcur,
-            (int64_t)(nkv * n_embd_hv), (int64_t)n_new);   // [row_size, n_new]
-
-        for (int i = 0; i < n_new; ++i) {
-            const int token_pos = e.num_computed + i;
-            const size_t slot_idx = kv_pool_.token_slot_idx(e.block_ids, token_pos);
-
-            // Assert slot is not in null block (block_id=0, slot 0..block_size-1).
-            // Writing to null block would silently corrupt shared-zero storage.
-            // (block_id=0 is reserved; real tokens start at block_id >= 1)
-            // We don't hard-assert here at graph build time since we can't check
-            // block_ids without CPU access — the assertion is in execute().
-
-            const size_t byte_off_k = slot_idx * (size_t)(nkv * n_embd_hq) * sizeof(float);
-            const size_t byte_off_v = slot_idx * (size_t)(nkv * n_embd_hv) * sizeof(float);
-
-            // View of Kcur_2d for token i: [row_size, 1]
-            ggml_tensor * k_src = ggml_view_2d(ctx, Kcur_2d,
-                (int64_t)(nkv * n_embd_hq), 1,
-                Kcur_2d->nb[1],
-                (size_t)i * Kcur_2d->nb[1]);
-
-            // View into persistent K pool at this slot
-            ggml_tensor * k_dst = ggml_view_2d(ctx, kv_pool_.k[il],
-                (int64_t)(nkv * n_embd_hq), 1,
-                kv_pool_.k[il]->nb[1],
-                byte_off_k);
-
-            ggml_tensor * k_write = ggml_cpy(ctx, k_src, k_dst);
-            ggml_build_forward_expand(gf, k_write);
-
-            // Same for V
-            ggml_tensor * v_src = ggml_view_2d(ctx, Vcur_2d,
-                (int64_t)(nkv * n_embd_hv), 1,
-                Vcur_2d->nb[1],
-                (size_t)i * Vcur_2d->nb[1]);
-            ggml_tensor * v_dst = ggml_view_2d(ctx, kv_pool_.v[il],
-                (int64_t)(nkv * n_embd_hv), 1,
-                kv_pool_.v[il]->nb[1],
-                byte_off_v);
-
-            ggml_tensor * v_write = ggml_cpy(ctx, v_src, v_dst);
-            ggml_build_forward_expand(gf, v_write);
-        }
-        stats_.kv_slots_written += (uint64_t)(n_new);
-
-        ggml_tensor * Q3 = Qcur;
-        ggml_tensor * K3 = nullptr;
-        ggml_tensor * V3 = nullptr;
-
-        if (e.num_computed == 0 && n_ctx == n_new) {
-            // Initial prefill can attend directly over the just-computed K/V.
-            // Do not read back from the persistent KV pool in the same graph:
-            // GGML does not model cpy-to-view side effects as dependencies, so
-            // a gather from the pool may be scheduled before the writes.
-            K3 = Kcur;
-            V3 = Vcur;
-        } else {
-            // ── KV read: gather all n_ctx slots for attention ─────────────────
-            // Build K_full and V_full tensors shaped [row_size, n_ctx] by
-            // gathering the physical slots in logical order.
-            //
-            // Previous tokens come from the persistent KV pool. Current-step
-            // tokens are wired directly from Kcur/Vcur so the graph has an
-            // explicit data dependency and does not rely on KV-write side
-            // effects being scheduled before KV-read gathers.
-            ggml_tensor * K_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
-                (int64_t)(nkv * n_embd_hq), (int64_t)n_ctx);
-            ggml_set_name(K_full, "K_gathered");
-
-            ggml_tensor * V_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
-                (int64_t)(nkv * n_embd_hv), (int64_t)n_ctx);
-            ggml_set_name(V_full, "V_gathered");
-
-            for (int t = 0; t < n_ctx; ++t) {
-                const size_t dst_off_k = (size_t)t   * (size_t)(nkv * n_embd_hq) * sizeof(float);
-                const size_t dst_off_v = (size_t)t   * (size_t)(nkv * n_embd_hv) * sizeof(float);
-
-                ggml_tensor * ks = nullptr;
-                ggml_tensor * vs = nullptr;
-                if (t < e.num_computed) {
-                    const size_t slot_idx = kv_pool_.token_slot_idx(e.block_ids, t);
-                    const size_t src_off_k = slot_idx * (size_t)(nkv * n_embd_hq) * sizeof(float);
-                    const size_t src_off_v = slot_idx * (size_t)(nkv * n_embd_hv) * sizeof(float);
-                    ks = ggml_view_2d(ctx, kv_pool_.k[il],
-                        (int64_t)(nkv * n_embd_hq), 1, kv_pool_.k[il]->nb[1], src_off_k);
-                    vs = ggml_view_2d(ctx, kv_pool_.v[il],
-                        (int64_t)(nkv * n_embd_hv), 1, kv_pool_.v[il]->nb[1], src_off_v);
-                } else {
-                    const int cur_idx = t - e.num_computed;
-                    ks = ggml_view_2d(ctx, Kcur_2d,
-                        (int64_t)(nkv * n_embd_hq), 1, Kcur_2d->nb[1],
-                        (size_t)cur_idx * Kcur_2d->nb[1]);
-                    vs = ggml_view_2d(ctx, Vcur_2d,
-                        (int64_t)(nkv * n_embd_hv), 1, Vcur_2d->nb[1],
-                        (size_t)cur_idx * Vcur_2d->nb[1]);
-                }
-
-                ggml_tensor * kd = ggml_view_2d(ctx, K_full,
-                    (int64_t)(nkv * n_embd_hq), 1, K_full->nb[1],          dst_off_k);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx, ks, kd));
-
-                ggml_tensor * vd = ggml_view_2d(ctx, V_full,
-                    (int64_t)(nkv * n_embd_hv), 1, V_full->nb[1],          dst_off_v);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx, vs, vd));
-            }
-
-            K3 = ggml_reshape_3d(ctx, K_full, n_embd_hq, nkv, (int64_t)n_ctx);
-            V3 = ggml_reshape_3d(ctx, V_full, n_embd_hv, nkv, (int64_t)n_ctx);
-        }
-
-        // ── Attention MHA ─────────────────────────────────────────────────────
-
-        gc_attn_params_t ap_full = ap;
-        ap_full.n_tokens = (int64_t)n_new;
-
-        ggml_tensor * attn_out = gc_build_attn_mha(ctx, gf,
-            Q3, K3, V3, kq_mask, nullptr, ap_full, cb, (int)il);
-
-        // ── Output projection ─────────────────────────────────────────────────
-        ggml_tensor * w_o = weight_view(ctx, find_w(GC_TENSOR_ATTN_OUT, "weight", (int)il));
-        if (!w_o) { err_ = "missing attn_out weight"; return nullptr; }
-        attn_out = ggml_mul_mat(ctx, w_o, attn_out);
-
-        if (lf.has_post_attn_norm) {
-            ggml_tensor * w_pan = weight_view(ctx, find_w(GC_TENSOR_POST_ATTN_NORM, "weight", (int)il));
-            if (w_pan)
-                attn_out = gc_build_norm(ctx, attn_out, w_pan, nullptr,
-                                         norm_params_.type, norm_params_.eps, cb, (int)il);
-        }
-
-        // ── Residual add ──────────────────────────────────────────────────────
-        cur = ggml_add(ctx, cur, attn_out);
-
-        // ── FFN ───────────────────────────────────────────────────────────────
-        ggml_tensor * w_fn = weight_view(ctx, find_w(GC_TENSOR_FFN_NORM, "weight", (int)il));
-        ggml_tensor * w_up = weight_view(ctx, find_w(GC_TENSOR_FFN_UP,   "weight", (int)il));
-        ggml_tensor * w_dn = weight_view(ctx, find_w(GC_TENSOR_FFN_DOWN, "weight", (int)il));
-        ggml_tensor * w_gt = ffn_params_.has_gate
-            ? weight_view(ctx, find_w(GC_TENSOR_FFN_GATE, "weight", (int)il))
-            : nullptr;
-        if (!w_fn || !w_up || !w_dn) { err_ = "missing ffn weights"; return nullptr; }
-
-        ggml_tensor * normed_ffn = gc_build_norm(ctx, cur, w_fn, nullptr,
-                                                  norm_params_.type, norm_params_.eps, cb, (int)il);
-        ggml_tensor * ffn_out = gc_build_ffn(ctx, normed_ffn,
-            w_up, nullptr, w_gt, nullptr, w_dn, nullptr,
-            ffn_params_.act, ffn_params_.gate_mode, cb, (int)il);
-
-        if (lf.has_post_ffn_norm) {
-            ggml_tensor * w_pfn = weight_view(ctx, find_w(GC_TENSOR_POST_MLP_NORM, "weight", (int)il));
-            if (w_pfn)
-                ffn_out = gc_build_norm(ctx, ffn_out, w_pfn, nullptr,
-                                        norm_params_.type, norm_params_.eps, cb, (int)il);
-        }
-
-        cur = ggml_add(ctx, cur, ffn_out);
+    if (!graph_builder_) {
+        err_ = "no graph builder configured for arch " + std::string(gc_arch_name(hp_.arch));
+        return nullptr;
     }
 
-    // ── Output norm + lm_head ─────────────────────────────────────────────────
-    if (w_output_norm_) {
-        ggml_tensor * w_on = weight_view(ctx, w_output_norm_);
-        if (w_on)
-            cur = gc_build_norm(ctx, cur, w_on, nullptr,
-                                norm_params_.type, norm_params_.eps, cb, -1);
-    }
+    GcGraphBuildParams bp;
+    bp.ctx          = ctx;
+    bp.gf           = gf;
+    bp.entry        = &e;
+    bp.kv_pool      = &kv_pool_;
+    bp.hp           = &hp_;
+    bp.get_weight   = get_weight;
+    bp.inp_tokens   = inp_tokens_;
+    bp.inp_pos      = inp_pos_;
+    bp.kq_mask_out  = kq_mask_out;
 
-    ggml_tensor * w_out = weight_view(ctx, w_output_);
-    if (!w_out) { err_ = "missing output weight"; return nullptr; }
-
-    ggml_tensor * logits = ggml_mul_mat(ctx, w_out, cur);
-    ggml_set_name(logits, "logits");
-    ggml_set_output(logits);
-    ggml_build_forward_expand(gf, logits);
-
-    return logits;
+    return graph_builder_->build(bp);
 }
 
 // ── Sampling ──────────────────────────────────────────────────────────────────

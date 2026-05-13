@@ -502,6 +502,7 @@ add_subdirectory(attention)
 add_subdirectory(kvcache)
 add_subdirectory(scheduler)
 add_subdirectory(engine)
+add_subdirectory(graph)
 add_subdirectory(server)
 
 # ── GGUF.CORE public aggregate target ────────────────────────────────────────
