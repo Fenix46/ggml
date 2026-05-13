@@ -97,7 +97,7 @@ public:
     std::vector<Token> tokenize();
 
 private:
-    const std::string & src_;
+    std::string src_;
     size_t             pos_;
     int                line_;
     int                col_;
@@ -123,7 +123,7 @@ std::vector<Token> Lexer::tokenize() {
     bool   in_text    = true;
 
     auto emit_text = [&]() {
-        if (pos_ > text_start) {
+        if (in_text && pos_ > text_start) {
             tokens.push_back(make(TokenType::Text, &src_[text_start], pos_ - text_start));
         }
     };
@@ -377,6 +377,9 @@ AstRoot Parser::parse() {
                 if (in.type == TokenType::Identifier) {
                     var += in.value;
                     adv();
+                } else if (in.type == TokenType::Dot) {
+                    var += ".";
+                    adv();
                 } else if (in.type == TokenType::Pipe) {
                     // Start filter chain
                     adv();
@@ -477,18 +480,15 @@ AstRoot Parser::parse() {
                     n.loop_var = tokens_[pos_].value;
                     adv();
                 }
-                // Expect comma or "in"
                 // Skip to the "in" keyword
                 while (pos_ < tokens_.size() && peek().type != TokenType::Identifier) adv();
-                // After "in", the iterable
+                // Advance past "in"
+                if (pos_ < tokens_.size() && tokens_[pos_].value == "in") adv();
+                // Read the iterable (e.g. "messages")
+                while (pos_ < tokens_.size() && peek().type != TokenType::Identifier) adv();
                 if (pos_ < tokens_.size() && tokens_[pos_].type == TokenType::Identifier) {
-                    // Could be "messages" or similar
-                    // For now, look for identifier that is the collection
-                    if (tokens_[pos_].value != "for" && tokens_[pos_].value != "in") {
-                        // It's the iterable name but we keep it in the node
-                        n.loop_iter = tokens_[pos_].value;
-                        adv();
-                    }
+                    n.loop_iter = tokens_[pos_].value;
+                    adv();
                 }
                 // Check for comma-separated parts (messages[0].role etc.)
                 while (pos_ < tokens_.size() && peek().type == TokenType::Comma) {
@@ -804,7 +804,6 @@ gc_status_t gc_chat_render(gc_chat_template_t * t,
     for (const auto & node : t->ast.nodes) {
         render_node(node, ctx, *out);
     }
-
     // If add_ass, append assistant start
     if (add_ass) {
         // Detect expected assistant prefix from template (simple heuristic)
