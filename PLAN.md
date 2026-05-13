@@ -351,10 +351,11 @@ src/graph/
 
 ## Fase C — Server Funzionante
 
-- [ ] **C1**: Compilare `gc_server_main` e avviarlo con modello toy.
-- [ ] **C2**: `curl POST /v1/chat/completions` deve rispondere con JSON valido.
-- [ ] **C3**: SSE streaming: `curl -N POST ... stream:true` deve produrre token uno alla volta.
-- [ ] **C4**: Testare error handling: richieste malformate → 400 con `{"error": {"message": ...}}`.
+- [x] **C1**: Server compila, `test_gc_server` passa (36 check, mock runtime).
+- [x] **C2**: `/v1/chat/completions` risponde con JSON valido nel test.
+- [x] **C3**: SSE streaming funziona nel test.
+- [x] **C4**: Error handling: richieste malformate → 400 con messaggio di errore.
+- [ ] **C5**: `gc_server_main` con modello reale: funziona ma output degenere (stesso token ripetuto). Da investigare: attenzione/RoPE/KV cache.
 
 ## Fase D — Port Forward Pass Reale (gc_graph_runner_t)
 
