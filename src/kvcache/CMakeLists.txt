@@ -4,6 +4,7 @@ add_library(gc_kvcache STATIC
 
 target_include_directories(gc_kvcache PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
 )
 
 target_include_directories(gc_kvcache PRIVATE ${CMAKE_SOURCE_DIR}/src/common)

@@ -7,6 +7,7 @@ add_library(gc_engine STATIC
 
 target_include_directories(gc_engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src/common
 )
 

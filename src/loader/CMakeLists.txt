@@ -6,7 +6,7 @@ add_library(gc_loader STATIC
 
 target_include_directories(gc_loader PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/include      # ggml.h, gguf.h, etc.
+    ${CMAKE_SOURCE_DIR}/include
 )
 
 target_link_libraries(gc_loader PRIVATE ggml)

@@ -9,16 +9,8 @@
 #include <string>
 
 // ── Status codes ──────────────────────────────────────────────────────────────
-
-typedef enum gc_status_t {
-    GC_OK              = 0,
-    GC_ERR_IO          = 1,
-    GC_ERR_ALLOC       = 2,
-    GC_ERR_INVALID     = 3,
-    GC_ERR_UNSUPPORTED = 4,
-    GC_ERR_NOT_FOUND   = 5,
-    GC_ERR_CORRUPT     = 6,
-} gc_status_t;
+// Use the canonical gc_status_t from the public header.
+#include <gc/gc_status.h>  // GC_OK, GC_ERR_*, etc.
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
