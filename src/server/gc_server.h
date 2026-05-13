@@ -35,6 +35,7 @@ public:
 
 using gc_server_tokenize_fn_t = std::function<std::vector<int32_t>(const std::string &)>;
 using gc_server_detokenize_fn_t = std::function<std::string(int32_t)>;
+using gc_server_detokenize_ids_fn_t = std::function<std::string(const std::vector<int32_t> &)>;
 
 class gc_engine_server_runtime_t final : public gc_server_runtime_t {
 public:
@@ -59,6 +60,7 @@ struct gc_server_params_t {
     int         port = 8080;
     gc_server_runtime_t * runtime = nullptr; // non-owning; optional
     gc_server_detokenize_fn_t detokenize_fn;
+    gc_server_detokenize_ids_fn_t detokenize_ids_fn;
 };
 
 class gc_server_t {

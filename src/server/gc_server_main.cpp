@@ -118,15 +118,11 @@ int main(int argc, char ** argv) {
         runner_cfg.repetition_window  = 64;
         auto graph_runner = std::make_unique<gc_graph_runner_t>(&loader, hp, runner_cfg);
         if (!graph_runner->ok()) {
-            std::fprintf(stderr, "warning: graph runner init failed (%s) — using synthetic runner\n",
+            std::fprintf(stderr, "error: graph runner init failed: %s\n",
                          graph_runner->error().c_str());
-            gc_ggml_model_runner_t::config_t synth_cfg;
-            synth_cfg.num_layers = hp.n_layer > 0 ? (int)hp.n_layer : 1;
-            synth_cfg.vocab_size = std::max(2, (int)vocab.n_tokens());
-            runner_holder = std::make_unique<gc_ggml_model_runner_t>(synth_cfg);
-        } else {
-            runner_holder = std::move(graph_runner);
+            return 1;
         }
+        runner_holder = std::move(graph_runner);
         gc_engine_t engine(ep, runner_holder.get());
 
         const int32_t eos_id = vocab.token_eos() == GC_TOKEN_NULL ? 2 : vocab.token_eos();
@@ -148,6 +144,9 @@ int main(int argc, char ** argv) {
                 return std::string("<tok:") + std::to_string(tok) + ">";
             }
             return s;
+        };
+        sp.detokenize_ids_fn = [&vocab](const std::vector<int32_t> & toks) {
+            return vocab.detokenize(toks, false);
         };
 
         gc_server_t server(sp);

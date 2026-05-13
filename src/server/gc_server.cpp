@@ -38,6 +38,25 @@ static std::string gc__token_to_text(int32_t tok, const gc_server_detokenize_fn_
     return "<tok:" + std::to_string(tok) + ">";
 }
 
+static std::string gc__detokenize_full(
+        const std::vector<int32_t> & toks,
+        const gc_server_detokenize_ids_fn_t & detok_ids,
+        const gc_server_detokenize_fn_t & detok_single) {
+    if (detok_ids) {
+        try {
+            return detok_ids(toks);
+        } catch (...) {
+            // fallback below
+        }
+    }
+    std::string out;
+    out.reserve(toks.size() * 4);
+    for (int32_t tok : toks) {
+        out += gc__token_to_text(tok, detok_single);
+    }
+    return out;
+}
+
 static int64_t gc__unix_time_now() {
     return static_cast<int64_t>(std::time(nullptr));
 }
@@ -215,6 +234,11 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
         reqv.stream = stream;
 
         const std::string rid = impl_->runtime->submit(reqv);
+        if (rid.empty()) {
+            res.status = 500;
+            res.set_content(R"({"error":{"message":"runtime submit failed","type":"server_error"}})", "application/json");
+            return;
+        }
         const std::string cid = "chatcmpl-" + rid;
 
         if (stream) {
@@ -233,26 +257,47 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
                     std::string role_evt = "data: " + role_chunk.dump() + "\n\n";
                     sink.write(role_evt.data(), role_evt.size());
 
-                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                    std::vector<int32_t> emitted_tokens;
+                    std::string rendered_text;
+                    int idle_polls = 0;
+                    const int max_idle_polls = 1500; // ~15s at 10ms
                     bool finished = false;
-                    while (std::chrono::steady_clock::now() < deadline && !finished) {
+                    while (!finished && idle_polls < max_idle_polls) {
+                        bool had_event = false;
                         auto evs = impl_->runtime->step();
                         for (const auto & ev : evs) {
                             if (ev.req_id != rid) continue;
+                            had_event = true;
                             if (ev.token >= 0) {
+                                emitted_tokens.push_back(ev.token);
+                                const std::string full = gc__detokenize_full(
+                                    emitted_tokens, params_.detokenize_ids_fn, params_.detokenize_fn);
+                                std::string delta = full;
+                                if (delta.rfind(rendered_text, 0) == 0) {
+                                    delta.erase(0, rendered_text.size());
+                                }
+                                rendered_text = full;
+                                if (delta.empty()) {
+                                    continue;
+                                }
                                 json tok_chunk = {
                                     {"id", cid},
                                     {"object", "chat.completion.chunk"},
                                     {"created", gc__unix_time_now()},
                                     {"model", "gc-server"},
-                                    {"choices", {{{"index", 0}, {"delta", {{"content", gc__token_to_text(ev.token, params_.detokenize_fn)}}}, {"finish_reason", nullptr}}}}
+                                    {"choices", {{{"index", 0}, {"delta", {{"content", delta}}}, {"finish_reason", nullptr}}}}
                                 };
                                 std::string evt = "data: " + tok_chunk.dump() + "\n\n";
                                 sink.write(evt.data(), evt.size());
                             }
                             finished = ev.finished;
                         }
-                        if (!finished) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        if (!had_event && !finished) {
+                            ++idle_polls;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        } else {
+                            idle_polls = 0;
+                        }
                     }
 
                     json end_chunk = {
@@ -275,19 +320,29 @@ gc_server_t::gc_server_t(const gc_server_params_t & params)
 
         std::string text;
         int completion_tokens = 0;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        std::vector<int32_t> emitted_tokens;
+        int idle_polls = 0;
+        const int max_idle_polls = 1500; // ~15s at 10ms
         bool finished = false;
-        while (std::chrono::steady_clock::now() < deadline && !finished) {
+        while (!finished && idle_polls < max_idle_polls) {
+            bool had_event = false;
             auto evs = impl_->runtime->step();
             for (const auto & ev : evs) {
                 if (ev.req_id != rid) continue;
+                had_event = true;
                 if (ev.token >= 0) {
-                    text += gc__token_to_text(ev.token, params_.detokenize_fn);
+                    emitted_tokens.push_back(ev.token);
+                    text = gc__detokenize_full(emitted_tokens, params_.detokenize_ids_fn, params_.detokenize_fn);
                     completion_tokens++;
                 }
                 finished = ev.finished;
             }
-            if (!finished) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            if (!had_event && !finished) {
+                ++idle_polls;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            } else {
+                idle_polls = 0;
+            }
         }
 
         json out = {
