@@ -1,5 +1,6 @@
 #include "gc_unicode.h"
 #include "gc_unicode_data.h"
+#include "gc_debug.h"
 
 #include <algorithm>
 #include <cassert>
@@ -700,7 +701,7 @@ std::vector<std::string> gc_regex_split(const std::string & text, const std::vec
                 bpe_offsets = gc__regex_split_stl(wtext, wexpr, bpe_offsets);
             }
         } catch (std::regex_error & e) {
-            fprintf(stderr, "gc_regex_split: failed for regex '%s': %s\n", expr.c_str(), e.what());
+            GC_LOG_ERR("gc_regex_split: failed for regex '%s': %s", expr.c_str(), e.what());
             throw std::runtime_error("gc_regex_split failed");
         }
     }
