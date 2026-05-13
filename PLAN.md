@@ -302,18 +302,77 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DGC_BACKEND=cpu     # CPU-only
 
 ## Milestone Schedule
 
-| Milestone | Phases | Deliverable |
-|-----------|--------|-------------|
-| M1 | 1–2 | Load any GGUF, inspect metadata and tensors |
-| M2 | 3–4 | Tokenize + apply chat template, round-trip test |
-| M3 | 5 | Single-sequence greedy decode (no paging) |
-| M4 | 6–7 | Paged KV + scheduler, multi-sequence batching |
-| M5 | 8 | Engine loop, streaming output, sampling |
-| M6 | 9 | OpenAI-compatible server, curl-testable |
+| Milestone | Phases | Deliverable | Stato |
+|:---------:|:-----:|------------|:----:|
+| M1 | 1–2 | Load any GGUF, inspect metadata and tensors | ✅ 55 test pass |
+| M2 | 3–4 | Tokenize + apply chat template, round-trip test | ⚠️ Tokenizer OK (vocab 0+), chat 10/12 fail |
+| M3 | 5 | Single-sequence greedy decode (no paging) | ❌ Da testare |
+| M4 | 6–7 | Paged KV + scheduler, multi-sequence batching | ✅ 144 test pass |
+| M5 | 8 | Engine loop, streaming output, sampling | ✅ 56 test (mock runner) |
+| M6 | 9 | OpenAI-compatible server, curl-testable | ⚠️ Compila, chat rotta blocca prompt |
 
 ---
 
-## Namespace & Naming Conventions
+# Piano Esecutivo — Task Sequenziali
+
+Ogni task deve essere completato e verificato (test pass) prima di passare al successivo.
+Flaggo ogni task come `[x]` quando è pronto.
+
+## Fase A — Graph Engine Ristrutturato (per-arch forward builders)
+
+Ristrutturare `gc_graph_runner.cpp` (901 linee, monolitico) in builder separati per architettura,
+seguendo il pattern di `llama-original/src/models/` e il coordinator pattern di vllm `GPUModelRunner`.
+
+Nuova struttura:
+```
+src/graph/
+├── gc_graph.h                 # Interfaccia base: GcGraphBuilder
+├── gc_graph_llama.cpp/.h      # Forward per Llama arch
+├── gc_graph_gemma.cpp/.h      # Forward per Gemma arch
+├── gc_graph_qwen2.cpp/.h      # Forward per Qwen2 arch
+├── gc_graph_runner.cpp        # Coordinatore (seleziona builder, pesi, KV, esecuzione)
+├── gc_graph_runner.h
+└── CMakeLists.txt
+```
+
+- [x] **A1**: Creare `src/graph/` directory, `gc_graph.h` con interfaccia astratta `GcGraphBuilder`.
+- [x] **A2**: Estrarre builder Llama da `gc_graph_runner.cpp` → `gc_graph_llama.cpp/.h` (294 linee).
+- [x] **A3**: Refactor `gc_graph_runner.cpp` (da 901→644 linee) come coordinatore: dispatcher via switch(arch) sul builder giusto, peso view in lambda inline.
+- [ ] **A4**: Copiare modello Llama-3.2-1B in `models/` e testare forward pass reale.
+- [ ] **A5**: Verificare output logits non degeneri e memory growth zero.
+- [ ] **A6**: Aggiungere `test_gc_graph` a CTest.
+
+## Fase B — Fix Chat Template Engine
+
+- [ ] **B1**: Diagnosticare `test_gc_chat` fallimenti. `{{ var }}` senza contesto produce stringa vuota (corretto), ma messaggi e loop `{% for %}` non funzionano.
+- [ ] **B2**: Fixare risoluzione variabili nel renderer: `messages`, `msg.role`, `msg.content` devono funzionare.
+- [ ] **B3**: Fixare filtri: `| strip`, `| upper` devono modificare il testo.
+- [ ] **B4**: Tutti i 12 test in `test_gc_chat.cpp` devono passare.
+
+## Fase C — Server Funzionante
+
+- [ ] **C1**: Compilare `gc_server_main` e avviarlo con modello toy.
+- [ ] **C2**: `curl POST /v1/chat/completions` deve rispondere con JSON valido.
+- [ ] **C3**: SSE streaming: `curl -N POST ... stream:true` deve produrre token uno alla volta.
+- [ ] **C4**: Testare error handling: richieste malformate → 400 con `{"error": {"message": ...}}`.
+
+## Fase D — Port Forward Pass Reale (gc_graph_runner_t)
+
+- [ ] **D1**: Verificare che `gc_graph_runner_t` con pesi reali da modello GGUF produca logits non degenere.
+- [ ] **D2**: Testare architettura Llama (la più comune) con forward pass e confronto golden.
+- [ ] **D3**: Testare GQA (`n_kv_heads != n_heads`).
+- [ ] **D4**: Testare RoPE varianti: standard, NEOX, YaRN.
+
+## Fase E — Pulizia e Robustezza
+
+- [ ] **E1**: Rimuovere `gc_mock_runtime_t` dal server (produzione).
+- [ ] **E2**: Aggiungere `-fsanitize=address,undefined` ai target debug.
+- [ ] **E3**: Test di concorrenza: scheduler con 10 richieste contemporanee di lunghezze variabili.
+- [ ] **E4**: Documentare API pubblica in `include/gc/`.
+
+---
+
+## Note di Architettura
 
 - Public C API: `gc_` prefix, snake_case (e.g. `gc_engine_create`)
 - Public C++ classes: `Gc` prefix, PascalCase (e.g. `GcEngine`)
